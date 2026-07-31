@@ -153,7 +153,7 @@ async fn serve_plaintext(
 async fn serve_tls(
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
-    acceptor: tokio_native_tls::TlsAcceptor,
+    acceptor: openssl::ssl::SslAcceptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let incoming = tls::build_tls_incoming(listener, acceptor);
