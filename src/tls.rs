@@ -391,6 +391,31 @@ ca_cert_path: /etc/tls/ca.pem
     }
 
     #[test]
+    fn provided_mode_nonexistent_ca_cert_errors() {
+        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("server cert generation");
+
+        let tmp = std::env::temp_dir();
+        let cert_path = tmp.join("praxis_tls_neg_test_cert.pem");
+        let key_path = tmp.join("praxis_tls_neg_test_key.pem");
+
+        std::fs::write(&cert_path, server.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("write key");
+
+        let cfg = TlsConfig {
+            mode: TlsMode::Provided,
+            cert_path: Some(format!("{}", cert_path.display())),
+            key_path: Some(format!("{}", key_path.display())),
+            ca_cert_path: Some("/nonexistent/ca.pem".to_owned()),
+        };
+
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "nonexistent CA cert should error");
+        let err = result.err().expect("checked: is_err() was true");
+        assert!(err.to_string().contains("CA"), "error should mention CA");
+    }
+
+    #[test]
     fn provided_mode_with_ca_cert_enables_mtls() {
         let ca = rcgen::generate_simple_self_signed(vec!["ca.example.com".to_owned()]).expect("CA cert generation");
         let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert generation");
