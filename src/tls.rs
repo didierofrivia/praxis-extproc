@@ -5,9 +5,26 @@
 //!
 //! Supports three modes: self-signed (ephemeral cert), provided
 //! (cert and key from disk), and plaintext (no TLS).
+//!
+//! TLS termination uses [`native-tls`] which delegates to the system's
+//! `OpenSSL` on Linux, enabling FIPS compliance via the OS TLS library.
 
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use native_tls::{Identity, TlsAcceptor};
 use serde::Deserialize;
-use tonic::transport::{Identity, ServerTlsConfig};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+};
+use tokio_native_tls::TlsAcceptor as TokioTlsAcceptor;
+use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::info;
 
 // -----------------------------------------------------------------------------
@@ -59,33 +76,111 @@ pub struct TlsConfig {
 
     /// Path to the PEM private key file (required for `provided` mode).
     pub key_path: Option<String>,
+
+    /// Path to a PEM CA certificate for mTLS client verification.
+    ///
+    /// When set, the server requires clients to present a valid certificate
+    /// signed by this CA (`provided` mode only).
+    pub ca_cert_path: Option<String>,
+}
+
+// -----------------------------------------------------------------------------
+// NativeTlsStream
+// -----------------------------------------------------------------------------
+
+/// A TLS-wrapped [`TcpStream`] that implements [`Connected`], [`AsyncRead`],
+/// and [`AsyncWrite`] for use with tonic's `serve_with_incoming_shutdown`.
+pub struct NativeTlsStream {
+    /// Underlying TLS stream.
+    inner: tokio_native_tls::TlsStream<TcpStream>,
+    /// Local socket address, captured before the TLS handshake.
+    local_addr: Option<SocketAddr>,
+    /// Remote socket address, captured before the TLS handshake.
+    remote_addr: Option<SocketAddr>,
+}
+
+impl Connected for NativeTlsStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        TcpConnectInfo {
+            local_addr: self.local_addr,
+            remote_addr: self.remote_addr,
+        }
+    }
+}
+
+impl AsyncRead for NativeTlsStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for NativeTlsStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // -----------------------------------------------------------------------------
 // TLS Setup
 // -----------------------------------------------------------------------------
 
-/// Build a [`ServerTlsConfig`] from the TLS settings.
+/// Build a [`TokioTlsAcceptor`] from the TLS settings.
 ///
 /// Returns `None` for plaintext mode. Generates a self-signed cert
 /// or loads from disk depending on the mode.
 ///
 /// # Errors
 ///
-/// Returns an error if cert/key files cannot be read or if
+/// Returns an error if cert/key/CA files cannot be read or if
 /// self-signed certificate generation fails.
-///
-/// [`ServerTlsConfig`]: tonic::transport::ServerTlsConfig
-pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfig>> {
+pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<TokioTlsAcceptor>> {
     match cfg.mode {
         TlsMode::None => Ok(None),
-        TlsMode::SelfSigned => build_self_signed(),
-        TlsMode::Provided => build_provided(cfg),
+        TlsMode::SelfSigned => build_self_signed().map(Some),
+        TlsMode::Provided => build_provided(cfg).map(Some),
     }
 }
 
-/// Generate a self-signed certificate using `rcgen`.
-fn build_self_signed() -> crate::error::Result<Option<ServerTlsConfig>> {
+/// Build a stream of TLS-wrapped connections from a bound [`TcpListener`].
+///
+/// Each incoming TCP connection is upgraded via the provided [`TokioTlsAcceptor`].
+/// The resulting stream yields [`NativeTlsStream`] items for use with
+/// tonic's `serve_with_incoming_shutdown`.
+pub fn build_tls_incoming(
+    listener: TcpListener,
+    acceptor: TokioTlsAcceptor,
+) -> impl Stream<Item = Result<NativeTlsStream, io::Error>> {
+    TcpListenerStream::new(listener).then(move |result| {
+        let acceptor = acceptor.clone();
+        async move {
+            let stream = result?;
+            let local_addr = stream.local_addr().ok();
+            let remote_addr = stream.peer_addr().ok();
+            let inner = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
+            Ok(NativeTlsStream {
+                inner,
+                local_addr,
+                remote_addr,
+            })
+        }
+    })
+}
+
+/// Generate an ephemeral self-signed certificate using `rcgen`.
+fn build_self_signed() -> crate::error::Result<TokioTlsAcceptor> {
     info!("generating self-signed TLS certificate");
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
@@ -94,19 +189,24 @@ fn build_self_signed() -> crate::error::Result<Option<ServerTlsConfig>> {
     let cert_pem = cert.cert.pem();
     let key_pem = cert.key_pair.serialize_pem();
 
-    let identity = Identity::from_pem(cert_pem, key_pem);
-    let tls_config = ServerTlsConfig::new().identity(identity);
+    let identity = Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes())
+        .map_err(|e| crate::error::ExtProcError::Config(format!("identity: {e}")))?;
 
-    Ok(Some(tls_config))
+    let mut builder = TlsAcceptor::builder(identity);
+    builder.accept_alpn(&["h2"]);
+    builder
+        .build()
+        .map(TokioTlsAcceptor::from)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("TLS acceptor: {e}")))
 }
 
-/// Load certificate and key from disk.
+/// Load certificate and key from disk, optionally configuring mTLS.
 ///
 /// # Errors
 ///
-/// Returns an error if `cert_path` or `key_path` is missing, or
-/// if the files cannot be read.
-fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfig>> {
+/// Returns an error if `cert_path` or `key_path` is missing, if any
+/// file cannot be read, or if TLS acceptor construction fails.
+fn build_provided(cfg: &TlsConfig) -> crate::error::Result<TokioTlsAcceptor> {
     let cert_path = cfg
         .cert_path
         .as_deref()
@@ -121,14 +221,24 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfi
 
     let cert_pem =
         std::fs::read(cert_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {cert_path}: {e}")))?;
-
     let key_pem =
         std::fs::read(key_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {key_path}: {e}")))?;
 
-    let identity = Identity::from_pem(cert_pem, key_pem);
-    let tls_config = ServerTlsConfig::new().identity(identity);
+    let identity = Identity::from_pkcs8(&cert_pem, &key_pem)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("identity: {e}")))?;
 
-    Ok(Some(tls_config))
+    if cfg.ca_cert_path.is_some() {
+        return Err(crate::error::ExtProcError::Config(
+            "mTLS client certificate verification requires the openssl crate and is not yet supported; remove ca_cert_path".to_owned(),
+        ));
+    }
+
+    let mut builder = TlsAcceptor::builder(identity);
+    builder.accept_alpn(&["h2"]);
+    builder
+        .build()
+        .map(TokioTlsAcceptor::from)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("TLS acceptor: {e}")))
 }
 
 // -----------------------------------------------------------------------------
@@ -153,11 +263,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn self_signed_mode_returns_some() {
         let cfg = TlsConfig {
             mode: TlsMode::SelfSigned,
             cert_path: None,
             key_path: None,
+            ca_cert_path: None,
         };
         let result = build_tls_config(&cfg).expect("should succeed");
         assert!(result.is_some(), "SelfSigned mode should return Some");
@@ -169,6 +281,7 @@ mod tests {
             mode: TlsMode::Provided,
             cert_path: None,
             key_path: Some("/tmp/key.pem".to_owned()),
+            ca_cert_path: None,
         };
         let err = build_tls_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("cert_path"), "error should mention cert_path");
@@ -180,6 +293,7 @@ mod tests {
             mode: TlsMode::Provided,
             cert_path: Some("/tmp/cert.pem".to_owned()),
             key_path: None,
+            ca_cert_path: None,
         };
         let err = build_tls_config(&cfg).unwrap_err();
         assert!(err.to_string().contains("key_path"), "error should mention key_path");
@@ -191,6 +305,7 @@ mod tests {
             mode: TlsMode::Provided,
             cert_path: Some("/nonexistent/cert.pem".to_owned()),
             key_path: Some("/nonexistent/key.pem".to_owned()),
+            ca_cert_path: None,
         };
         assert!(build_tls_config(&cfg).is_err(), "nonexistent files should error");
     }
