@@ -275,10 +275,11 @@ fn set_alpn_h2(builder: &mut SslAcceptorBuilder) -> crate::error::Result<()> {
     reason = "tests"
 )]
 mod tests {
-    use super::*;
     use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tonic::transport::server::Connected;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tonic::transport::server::Connected as _;
+
+    use super::*;
 
     fn make_test_acceptor() -> SslAcceptor {
         build_tls_config(&TlsConfig {
@@ -296,7 +297,11 @@ mod tests {
         builder.set_verify(SslVerifyMode::NONE);
         let connector = builder.build();
         let tcp = TcpStream::connect(addr).await.expect("TCP connect");
-        let ssl = connector.configure().expect("configure").into_ssl("localhost").expect("into_ssl");
+        let ssl = connector
+            .configure()
+            .expect("configure")
+            .into_ssl("localhost")
+            .expect("into_ssl");
         let mut tls = tokio_openssl::SslStream::new(ssl, tcp).expect("SslStream::new");
         Pin::new(&mut tls).connect().await.expect("TLS handshake");
         tls
@@ -313,7 +318,7 @@ mod tests {
             let info = stream.connect_info();
             assert!(info.local_addr.is_some(), "local addr should be populated");
             assert!(info.remote_addr.is_some(), "remote addr should be populated");
-            let mut buf = [0u8; 5];
+            let mut buf = [0_u8; 5];
             stream.read_exact(&mut buf).await.expect("server read");
             stream.write_all(&buf).await.expect("server write");
         });
@@ -321,7 +326,7 @@ mod tests {
         let client = tokio::spawn(async move {
             let mut tls = connect_test_client(addr).await;
             tls.write_all(b"hello").await.expect("client write");
-            let mut buf = [0u8; 5];
+            let mut buf = [0_u8; 5];
             tls.read_exact(&mut buf).await.expect("client read");
             assert_eq!(&buf, b"hello", "echoed bytes must match");
         });
@@ -445,8 +450,7 @@ ca_cert_path: /etc/tls/ca.pem
 
     #[test]
     fn provided_mode_nonexistent_ca_cert_errors() {
-        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("server cert generation");
+        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert generation");
 
         let tmp = std::env::temp_dir();
         let cert_path = tmp.join("praxis_tls_neg_test_cert.pem");
