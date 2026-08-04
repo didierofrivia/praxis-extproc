@@ -27,8 +27,12 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
 };
-use tokio_stream::{Stream, StreamExt as _, wrappers::TcpListenerStream};
+use tokio_stream::{
+    Stream, StreamExt as _,
+    wrappers::{ReceiverStream, TcpListenerStream},
+};
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::info;
 
@@ -157,34 +161,69 @@ pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<SslAccep
     }
 }
 
+/// Maximum number of TLS handshakes that may be in-flight simultaneously.
+const HANDSHAKE_CONCURRENCY: usize = 64;
+
 /// Build a stream of TLS-wrapped connections from a bound [`TcpListener`].
 ///
-/// Each incoming TCP connection is upgraded via the provided [`SslAcceptor`].
-/// The resulting stream yields [`OpenSslStream`] items for use with
-/// tonic's `serve_with_incoming_shutdown`.
+/// Each accepted TCP connection has its TLS handshake performed in an
+/// independent [`tokio::spawn`]ed task, so a slow or stalled handshake
+/// does not block subsequent accepts. Up to `HANDSHAKE_CONCURRENCY`
+/// handshakes may be in-flight at once. The stream ends when the
+/// [`TcpListener`] closes or the caller drops the returned stream.
 pub fn build_tls_incoming(
     listener: TcpListener,
     acceptor: SslAcceptor,
 ) -> impl Stream<Item = Result<OpenSslStream, io::Error>> {
     let acceptor = Arc::new(acceptor);
-    TcpListenerStream::new(listener).then(move |result| {
-        let acceptor = Arc::clone(&acceptor);
-        async move {
-            let stream = result?;
-            let local_addr = stream.local_addr().ok();
-            let remote_addr = stream.peer_addr().ok();
-            let ssl = Ssl::new(acceptor.context()).map_err(io::Error::other)?;
-            let mut tls = tokio_openssl::SslStream::new(ssl, stream).map_err(io::Error::other)?;
-            Pin::new(&mut tls)
-                .accept()
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
-            Ok(OpenSslStream {
-                inner: tls,
-                local_addr,
-                remote_addr,
-            })
+    let (tx, rx) = mpsc::channel(HANDSHAKE_CONCURRENCY);
+    let tx_watch = tx.clone();
+    tokio::spawn(async move {
+        let mut tcp = TcpListenerStream::new(listener);
+        loop {
+            tokio::select! {
+                () = tx_watch.closed() => break,
+                maybe = tcp.next() => {
+                    let Some(result) = maybe else { break };
+                    let acceptor = Arc::clone(&acceptor);
+                    let tx_inner = tx.clone();
+                    tokio::spawn(async move {
+                        let outcome = perform_handshake(result, acceptor).await;
+                        let Ok(()) = tx_inner.send(outcome).await else { return };
+                    });
+                }
+            }
         }
+    });
+    ReceiverStream::new(rx)
+}
+
+/// Perform a TLS handshake on an accepted TCP connection.
+///
+/// Wraps `result` in an [`OpenSslStream`], capturing socket addresses
+/// before the handshake so [`Connected::connect_info`] is always populated.
+///
+/// # Errors
+///
+/// Returns an error if the TCP accept, SSL context creation, or TLS
+/// handshake fails.
+async fn perform_handshake(
+    result: Result<TcpStream, io::Error>,
+    acceptor: Arc<SslAcceptor>,
+) -> Result<OpenSslStream, io::Error> {
+    let stream = result?;
+    let local_addr = stream.local_addr().ok();
+    let remote_addr = stream.peer_addr().ok();
+    let ssl = Ssl::new(acceptor.context()).map_err(io::Error::other)?;
+    let mut tls = tokio_openssl::SslStream::new(ssl, stream).map_err(io::Error::other)?;
+    Pin::new(&mut tls)
+        .accept()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
+    Ok(OpenSslStream {
+        inner: tls,
+        local_addr,
+        remote_addr,
     })
 }
 
@@ -311,7 +350,7 @@ mod tests {
     async fn build_tls_incoming_accepts_connection_and_exchanges_data() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let mut incoming = Box::pin(build_tls_incoming(listener, make_test_acceptor()));
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor());
 
         let server = tokio::spawn(async move {
             let mut stream = incoming.next().await.expect("stream item").expect("no TLS error");
