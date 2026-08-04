@@ -276,6 +276,59 @@ fn set_alpn_h2(builder: &mut SslAcceptorBuilder) -> crate::error::Result<()> {
 )]
 mod tests {
     use super::*;
+    use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tonic::transport::server::Connected;
+
+    fn make_test_acceptor() -> SslAcceptor {
+        build_tls_config(&TlsConfig {
+            mode: TlsMode::SelfSigned,
+            cert_path: None,
+            key_path: None,
+            ca_cert_path: None,
+        })
+        .expect("build_tls_config")
+        .expect("SelfSigned should return Some acceptor")
+    }
+
+    async fn connect_test_client(addr: SocketAddr) -> tokio_openssl::SslStream<TcpStream> {
+        let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector builder");
+        builder.set_verify(SslVerifyMode::NONE);
+        let connector = builder.build();
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        let ssl = connector.configure().expect("configure").into_ssl("localhost").expect("into_ssl");
+        let mut tls = tokio_openssl::SslStream::new(ssl, tcp).expect("SslStream::new");
+        Pin::new(&mut tls).connect().await.expect("TLS handshake");
+        tls
+    }
+
+    #[tokio::test]
+    async fn build_tls_incoming_accepts_connection_and_exchanges_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut incoming = Box::pin(build_tls_incoming(listener, make_test_acceptor()));
+
+        let server = tokio::spawn(async move {
+            let mut stream = incoming.next().await.expect("stream item").expect("no TLS error");
+            let info = stream.connect_info();
+            assert!(info.local_addr.is_some(), "local addr should be populated");
+            assert!(info.remote_addr.is_some(), "remote addr should be populated");
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.expect("server read");
+            stream.write_all(&buf).await.expect("server write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut tls = connect_test_client(addr).await;
+            tls.write_all(b"hello").await.expect("client write");
+            let mut buf = [0u8; 5];
+            tls.read_exact(&mut buf).await.expect("client read");
+            assert_eq!(&buf, b"hello", "echoed bytes must match");
+        });
+
+        server.await.expect("server task");
+        client.await.expect("client task");
+    }
 
     #[test]
     fn none_mode_returns_none() {
