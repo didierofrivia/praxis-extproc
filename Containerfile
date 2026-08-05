@@ -19,7 +19,7 @@ FROM registry.access.redhat.com/ubi10/ubi AS builder
 
 ARG CARGO_PROFILE=release
 
-RUN dnf install -y gcc gcc-c++ cmake make perl \
+RUN dnf install -y gcc gcc-c++ cmake make perl openssl-devel \
     && dnf clean all
 
 ENV RUSTUP_HOME=/usr/local/rustup \
