@@ -202,8 +202,15 @@ async fn process_messages(
     tx: &mpsc::Sender<Result<ProcessingResponse, Status>>,
     stream_state: &mut StreamState,
 ) -> Result<(), Status> {
+    let mut first_message_processed = false;
+
     while let Some(result) = inbound.next().await {
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
+
+        if !first_message_processed {
+            config_from_first_message(stream_state, msg.protocol_config);
+            first_message_processed = true;
+        }
 
         let Some(req) = msg.request else {
             warn!("received ProcessingRequest with no request field");
@@ -225,6 +232,18 @@ async fn process_messages(
     }
 
     Ok(())
+}
+
+/// Parses `protocol_config` from first message
+fn config_from_first_message(stream_state: &mut StreamState, protocol_config: Option<ProtocolConfiguration>) {
+    if let Some(proto_cfg) = protocol_config {
+        stream_state.protocol_config = ProtocolConfig::from(proto_cfg);
+        debug!(
+            request_mode = ?stream_state.protocol_config.request_body_mode,
+            response_mode = ?stream_state.protocol_config.response_body_mode,
+            "ExtProc protocol configuration received from Envoy"
+        );
+    }
 }
 
 /// Dispatch a single ExtProc request variant to the appropriate handler.
@@ -487,7 +506,7 @@ async fn run_request_filters(
     let body_data = body_data_if_present(&state.request_body);
 
     let responses = if body_data.is_some() {
-        response::request_body(body_data, mutation)
+        response::request_body(body_data, mutation, state.protocol_config.request_body_mode)
     } else {
         vec![response::request_headers(mutation)]
     };
@@ -553,7 +572,11 @@ async fn run_response_filters(
     let body_data = body_data_if_present(&state.response_body);
 
     if body_data.is_some() {
-        Ok(response::response_body(body_data, mutation))
+        Ok(response::response_body(
+            body_data,
+            mutation,
+            state.protocol_config.response_body_mode,
+        ))
     } else {
         Ok(vec![response::response_headers(mutation)])
     }
