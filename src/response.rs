@@ -14,7 +14,6 @@ use praxis_proto::envoy::service::ext_proc::v3::{
     StreamedBodyResponse, TrailersResponse, body_mutation, common_response::ResponseStatus,
     processing_response::Response,
 };
-use tracing::warn;
 
 // -----------------------------------------------------------------------------
 // Body Processing Modes
@@ -26,33 +25,40 @@ use tracing::warn;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum BodyMode {
     /// No body sent.
+    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     None = 0,
     /// Body sent in streaming mode (incremental processing).
+    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     Streamed = 1,
     /// Body buffered until complete, then sent as single chunk.
     #[default]
     Buffered = 2,
     /// Body sent in buffered partial mode.
+    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     BufferedPartial = 3,
     /// Body sent in full-duplex streaming mode with chunked responses.
     FullDuplexStreamed = 4,
 }
 
-impl From<i32> for BodyMode {
+impl TryFrom<i32> for BodyMode {
+    type Error = String;
+
     /// Parse from Envoy's `protocol_config` field.
     ///
-    /// Unknown values default to [`BodyMode::Buffered`] for safety.
-    fn from(value: i32) -> Self {
+    /// Only `BUFFERED` (2) and `FULL_DUPLEX_STREAMED` (4) are supported at this stage.
+    /// `NONE` (0) maps to `BUFFERED` (2)
+    ///
+    /// # Errors
+    ///
+    /// Returns error message for unsupported modes.
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
-            0 => Self::None,
-            1 => Self::Streamed,
-            2 => Self::Buffered,
-            3 => Self::BufferedPartial,
-            4 => Self::FullDuplexStreamed,
-            _ => {
-                warn!(value, "unknown body mode from Envoy, defaulting to BUFFERED");
-                Self::Buffered
-            },
+            0 | 2 => Ok(Self::Buffered),
+            4 => Ok(Self::FullDuplexStreamed),
+            // Other modes documented but not yet implemented
+            1 => Err("BodySendMode::STREAMED (1) is not yet implemented".to_owned()),
+            3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
+            _ => Err(format!("unknown BodySendMode value {value}")),
         }
     }
 }
@@ -215,13 +221,9 @@ fn body_responses(
     is_request: bool,
     body_mode: BodyMode,
 ) -> Vec<ProcessingResponse> {
-    #[expect(
-        clippy::single_match_else,
-        reason = "Preparing for future implementation of different body modes from Envoy"
-    )]
     match body_mode {
         BodyMode::FullDuplexStreamed => body_responses_streamed(body, mutation, is_request),
-        _ => {
+        BodyMode::None | BodyMode::Streamed | BodyMode::Buffered | BodyMode::BufferedPartial => {
             // BUFFERED mode (and others): use BodyMutation::Body for full replacement
             let body_mutation = body.filter(|b| !b.is_empty()).map(make_body_mutation);
 
@@ -250,7 +252,7 @@ fn make_body_mutation(data: &[u8]) -> BodyMutation {
 /// each with `end_of_stream` set on the final chunk only.
 fn body_responses_streamed(
     body: Option<&[u8]>,
-    mutation: Option<HeaderMutation>,
+    mut mutation: Option<HeaderMutation>,
     is_request: bool,
 ) -> Vec<ProcessingResponse> {
     let Some(data) = body.filter(|b| !b.is_empty()) else {
@@ -271,7 +273,7 @@ fn body_responses_streamed(
         .into_iter()
         .enumerate()
         .map(|(i, (chunk, eos))| {
-            make_streamed_response(chunk, eos, if i == 0 { mutation.clone() } else { None }, is_request)
+            make_streamed_response(chunk, eos, if i == 0 { mutation.take() } else { None }, is_request)
         })
         .collect()
 }
@@ -669,6 +671,20 @@ mod tests {
             },
             other => panic!("BUFFERED should use Body variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn body_mode_from_i32_valid_modes() {
+        assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(2).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(4).unwrap(), BodyMode::FullDuplexStreamed);
+    }
+
+    #[test]
+    fn body_mode_from_i32_invalid_modes() {
+        assert!(BodyMode::try_from(1).is_err());
+        assert!(BodyMode::try_from(3).is_err());
+        assert!(BodyMode::try_from(999).is_err());
     }
 
     // -----------------------------------------------------------------------------
