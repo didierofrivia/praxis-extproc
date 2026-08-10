@@ -41,6 +41,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Server};
 
 // -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+const TIMEOUT_MILLIS: u64 = 500;
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -567,10 +573,13 @@ async fn duplicate_eos_in_request_headers_rejected() {
 
     tx.send(make_request_headers("GET", "/", true)).await.unwrap();
 
-    let err = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message())
-        .await
-        .expect("timed out waiting for duplicate EOS rejection")
-        .expect_err("duplicate EOS was accepted");
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for duplicate EOS rejection")
+    .expect_err("duplicate EOS was accepted");
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
         err.message().contains("after end_of_stream"),
@@ -621,7 +630,14 @@ async fn duplicate_eos_in_request_body_rejected() {
     .await
     .unwrap();
 
-    let err = response_stream.message().await.unwrap_err();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error");
+
+    let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
         err.message().contains("after end_of_stream"),
@@ -676,8 +692,14 @@ async fn duplicate_eos_in_response_headers_rejected() {
     .await
     .unwrap();
 
-    // This should fail with InvalidArgument
-    let err = response_stream.message().await.unwrap_err();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error");
+
+    let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
         err.message().contains("after end_of_stream"),
@@ -746,7 +768,14 @@ async fn duplicate_eos_in_response_body_rejected() {
     .await
     .unwrap();
 
-    let err = response_stream.message().await.unwrap_err();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error");
+
+    let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
         err.message().contains("after end_of_stream"),
@@ -798,7 +827,11 @@ async fn repro_ap_post_eos_body() {
     .await
     .unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -838,7 +871,11 @@ async fn repro_ap_post_eos_headers() {
         .await
         .unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -873,7 +910,11 @@ async fn wrong_wire_mode_unsupported_streamed_rejected() {
         send_body_without_waiting_for_header_response: false,
     });
     tx.send(headers).await.unwrap();
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -918,7 +959,11 @@ async fn unsupported_response_body_mode_rejected() {
     });
     tx.send(headers).await.unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
 
     match outcome {
         Ok(Err(err)) => {
@@ -968,7 +1013,11 @@ async fn empty_full_duplex_emits_streamed_eos() {
     .await
     .unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
 
     match outcome {
         Ok(Ok(Some(msg))) => {
@@ -1027,11 +1076,14 @@ async fn full_duplex_single_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message())
-        .await
-        .expect("timed out waiting for header response")
-        .expect("header response stream error")
-        .expect("stream closed before header response");
+    let _header_resp = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
 
     let body_data = vec![0_u8; 1024];
     tx.send(ProcessingRequest {
@@ -1044,7 +1096,11 @@ async fn full_duplex_single_chunk_request_body() {
     .await
     .unwrap();
 
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await;
 
     match outcome {
         Ok(Ok(Some(msg))) => {
@@ -1085,11 +1141,14 @@ async fn full_duplex_multi_chunk_request_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message())
-        .await
-        .expect("timed out waiting for header response")
-        .expect("header response stream error")
-        .expect("stream closed before header response");
+    let _header_resp = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
 
     let body_data: Vec<u8> = (0_u32..100_000).map(|i| (i % 251) as u8).collect();
     tx.send(ProcessingRequest {
@@ -1102,40 +1161,25 @@ async fn full_duplex_multi_chunk_request_body() {
     .await
     .unwrap();
 
-    let mut chunks = Vec::new();
-    let mut received_body = Vec::with_capacity(body_data.len());
-
-    loop {
-        assert!(
-            chunks.len() < MAX_CHUNKS,
-            "received {MAX_CHUNKS} chunks without end_of_stream; server never terminated the body stream"
-        );
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
-
-        match outcome {
-            Ok(Ok(Some(msg))) => {
-                if let Some(RespVariant::RequestBody(b)) = &msg.response
-                    && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
-                        .response
+    let (chunks, received_body) = collect_streamed_chunks(
+        &mut response_stream,
+        |msg| {
+            msg.response.as_ref().and_then(|r| match r {
+                RespVariant::RequestBody(b) => {
+                    b.response
                         .as_ref()
                         .and_then(|c| c.body_mutation.as_ref())
-                        .and_then(|m| m.mutation.as_ref())
-                {
-                    received_body.extend_from_slice(&s.body);
-                    let is_eos = s.end_of_stream;
-                    chunks.push(s.clone());
-                    if is_eos {
-                        break;
-                    }
-                } else {
-                    panic!("expected StreamedResponse, got: {msg:?}");
-                }
-            },
-            Ok(Ok(None)) => panic!("stream closed before EOS"),
-            Ok(Err(err)) => panic!("stream error: {err}"),
-            Err(_) => panic!("timed out waiting for chunk"),
-        }
-    }
+                        .and_then(|m| match &m.mutation {
+                            Some(body_mutation::Mutation::StreamedResponse(s)) => Some(s),
+                            _ => None,
+                        })
+                },
+                _ => None,
+            })
+        },
+        MAX_CHUNKS,
+    )
+    .await;
 
     assert!(chunks.len() > 1, "100KB body should produce multiple chunks");
     assert_eq!(received_body, body_data, "streamed bytes should match input");
@@ -1163,11 +1207,14 @@ async fn full_duplex_response_body() {
     });
     tx.send(headers).await.unwrap();
 
-    let _header_resp = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message())
-        .await
-        .expect("timed out waiting for header response")
-        .expect("header response stream error")
-        .expect("stream closed before header response");
+    let _header_resp = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for header response")
+    .expect("header response stream error")
+    .expect("stream closed before header response");
 
     tx.send(make_response_headers(200, false)).await.unwrap();
 
@@ -1184,40 +1231,25 @@ async fn full_duplex_response_body() {
     .await
     .unwrap();
 
-    let mut chunks = Vec::new();
-    let mut received_body = Vec::with_capacity(body_data.len());
-
-    loop {
-        assert!(
-            chunks.len() < MAX_CHUNKS,
-            "received {MAX_CHUNKS} chunks without end_of_stream; server never terminated the body stream"
-        );
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(500), response_stream.message()).await;
-
-        match outcome {
-            Ok(Ok(Some(msg))) => {
-                if let Some(RespVariant::ResponseBody(b)) = &msg.response
-                    && let Some(body_mutation::Mutation::StreamedResponse(s)) = b
-                        .response
+    let (chunks, received_body) = collect_streamed_chunks(
+        &mut response_stream,
+        |msg| {
+            msg.response.as_ref().and_then(|r| match r {
+                RespVariant::ResponseBody(b) => {
+                    b.response
                         .as_ref()
                         .and_then(|c| c.body_mutation.as_ref())
-                        .and_then(|m| m.mutation.as_ref())
-                {
-                    received_body.extend_from_slice(&s.body);
-                    let is_eos = s.end_of_stream;
-                    chunks.push(s.clone());
-                    if is_eos {
-                        break;
-                    }
-                } else {
-                    panic!("expected StreamedResponse, got: {msg:?}");
-                }
-            },
-            Ok(Ok(None)) => panic!("stream closed before EOS"),
-            Ok(Err(err)) => panic!("stream error: {err}"),
-            Err(_) => panic!("timed out waiting for chunk"),
-        }
-    }
+                        .and_then(|m| match &m.mutation {
+                            Some(body_mutation::Mutation::StreamedResponse(s)) => Some(s),
+                            _ => None,
+                        })
+                },
+                _ => None,
+            })
+        },
+        MAX_CHUNKS,
+    )
+    .await;
 
     assert!(chunks.len() > 1, "100KB response body should produce multiple chunks");
     assert_eq!(received_body, body_data, "streamed bytes should match input");
@@ -1490,6 +1522,61 @@ async fn collect_responses(inbound: &mut tonic::Streaming<ProcessingResponse>) -
     }
 
     responses
+}
+
+/// Collect streamed body chunks from a response stream.
+///
+/// Returns `(chunks, reassembled_body)` where chunks is the vector of
+/// `StreamedBodyResponse` messages and `reassembled_body` is all chunk
+/// bodies concatenated.
+///
+/// Panics if stream errors, times out, or exceeds `max_chunks` without EOS.
+async fn collect_streamed_chunks<F>(
+    response_stream: &mut tonic::Streaming<ProcessingResponse>,
+    extract_fn: F,
+    max_chunks: usize,
+) -> (
+    Vec<praxis_proto::envoy::service::ext_proc::v3::StreamedBodyResponse>,
+    Vec<u8>,
+)
+where
+    F: Fn(&ProcessingResponse) -> Option<&praxis_proto::envoy::service::ext_proc::v3::StreamedBodyResponse>,
+{
+    let mut chunks = Vec::new();
+    let mut received_body = Vec::new();
+
+    loop {
+        assert!(
+            chunks.len() < max_chunks,
+            "received {max_chunks} chunks without end_of_stream"
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(TIMEOUT_MILLIS),
+            response_stream.message(),
+        )
+        .await;
+
+        match outcome {
+            Ok(Ok(Some(msg))) => {
+                if let Some(s) = extract_fn(&msg) {
+                    received_body.extend_from_slice(&s.body);
+                    let is_eos = s.end_of_stream;
+                    chunks.push(s.clone());
+                    if is_eos {
+                        break;
+                    }
+                } else {
+                    panic!("expected StreamedResponse, got: {msg:?}");
+                }
+            },
+            Ok(Ok(None)) => panic!("stream closed before EOS"),
+            Ok(Err(err)) => panic!("stream error: {err}"),
+            Err(_) => panic!("timed out waiting for chunk"),
+        }
+    }
+
+    (chunks, received_body)
 }
 
 fn has_request_headers_response(responses: &[ProcessingResponse]) -> bool {
