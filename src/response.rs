@@ -186,7 +186,8 @@ pub(crate) fn immediate(imm: ImmediateResponse) -> ProcessingResponse {
 ///
 /// Returns a `Vec` of `(chunk, end_of_stream)` pairs. The last chunk
 /// has `end_of_stream` set to `true`.
-pub(crate) fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
+#[cfg(test)]
+fn chunk_body(data: &[u8]) -> Vec<(&[u8], bool)> {
     if data.is_empty() {
         return vec![(data, true)];
     }
@@ -248,8 +249,8 @@ fn make_body_mutation(data: &[u8]) -> BodyMutation {
 
 /// Build streamed body responses using `StreamedBodyResponse` wire format.
 ///
-/// Chunks the body at 62 KiB boundaries and returns multiple responses,
-/// each with `end_of_stream` set on the final chunk only.
+/// Chunks the body at 62 KiB boundaries and returns responses.
+/// Each chunk is copied exactly once into its `ProcessingResponse`.
 ///
 /// Even for empty bodies, `FULL_DUPLEX_STREAMED` mode requires
 /// `StreamedBodyResponse { body: [], end_of_stream: true }`.
@@ -259,18 +260,23 @@ fn body_responses_streamed(
     is_request: bool,
 ) -> Vec<ProcessingResponse> {
     let Some(data) = body.filter(|b| !b.is_empty()) else {
-        // Empty body: must still use StreamedBodyResponse with empty chunk and EOS
         return vec![make_streamed_response(&[], true, mutation, is_request)];
     };
 
-    let chunks = chunk_body(data);
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(i, (chunk, eos))| {
-            make_streamed_response(chunk, eos, if i == 0 { mutation.take() } else { None }, is_request)
-        })
-        .collect()
+    let mut responses = Vec::new();
+    let mut offset = 0;
+
+    while offset < data.len() {
+        let end = (offset + BODY_CHUNK_LIMIT).min(data.len());
+        let eos = end == data.len();
+        let chunk = data.get(offset..end).unwrap_or(&[]);
+        let header_mut = if offset == 0 { mutation.take() } else { None };
+
+        responses.push(make_streamed_response(chunk, eos, header_mut, is_request));
+        offset = end;
+    }
+
+    responses
 }
 
 /// Build a single streamed body response with chunk data.
