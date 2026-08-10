@@ -148,14 +148,44 @@ impl AsyncWrite for OpenSslStream {
 ///
 /// # Errors
 ///
-/// Returns an error if cert/key/CA files cannot be read or if
+/// Returns an error if cert/key/CA path fields are set for a mode that
+/// does not use them, if cert/key/CA files cannot be read, or if
 /// self-signed certificate generation or `OpenSSL` setup fails.
 pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<SslAcceptor>> {
     match cfg.mode {
-        TlsMode::None => Ok(None),
-        TlsMode::SelfSigned => build_self_signed().map(Some),
+        TlsMode::None => {
+            validate_no_path_fields("none", cfg)?;
+            Ok(None)
+        },
+        TlsMode::SelfSigned => {
+            validate_no_path_fields("self_signed", cfg)?;
+            build_self_signed().map(Some)
+        },
         TlsMode::Provided => build_provided(cfg).map(Some),
     }
+}
+
+/// Reject any path fields that are set but unused in the given mode.
+///
+/// Prevents silent misconfiguration where a user sets e.g. `ca_cert_path`
+/// expecting mTLS but the active mode ignores it.
+fn validate_no_path_fields(mode: &'static str, cfg: &TlsConfig) -> crate::error::Result<()> {
+    if cfg.cert_path.is_some() {
+        return Err(crate::error::ExtProcError::Config(format!(
+            "tls.cert_path is not used in `{mode}` mode"
+        )));
+    }
+    if cfg.key_path.is_some() {
+        return Err(crate::error::ExtProcError::Config(format!(
+            "tls.key_path is not used in `{mode}` mode"
+        )));
+    }
+    if cfg.ca_cert_path.is_some() {
+        return Err(crate::error::ExtProcError::Config(format!(
+            "tls.ca_cert_path is not used in `{mode}` mode"
+        )));
+    }
+    Ok(())
 }
 
 /// Maximum number of TLS handshakes running concurrently via `buffer_unordered`.
@@ -414,6 +444,37 @@ mod tests {
         assert!(second.is_ok(), "legitimate client should succeed after slot frees");
 
         drop(client.await.expect("client task"));
+    }
+
+    #[test]
+    fn none_mode_rejects_cert_path() {
+        let cfg = TlsConfig {
+            mode: TlsMode::None,
+            cert_path: Some("/some/cert.pem".to_owned()),
+            key_path: None,
+            ca_cert_path: None,
+        };
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "none mode with cert_path should error");
+        let err = result.err().expect("checked: is_err()");
+        assert!(err.to_string().contains("cert_path"), "error should mention cert_path");
+    }
+
+    #[test]
+    fn self_signed_mode_rejects_ca_cert_path() {
+        let cfg = TlsConfig {
+            mode: TlsMode::SelfSigned,
+            cert_path: None,
+            key_path: None,
+            ca_cert_path: Some("/some/ca.pem".to_owned()),
+        };
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "self_signed mode with ca_cert_path should error");
+        let err = result.err().expect("checked: is_err()");
+        assert!(
+            err.to_string().contains("ca_cert_path"),
+            "error should mention ca_cert_path"
+        );
     }
 
     #[test]
