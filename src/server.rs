@@ -366,7 +366,7 @@ async fn handle_request_headers(
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_request_headers_pipeline(pipeline, state).await;
+        return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
 
     Ok(vec![response::request_headers(None)])
@@ -389,7 +389,7 @@ async fn handle_request_body(
         return Ok(Vec::new());
     }
 
-    run_request_body_pipeline(pipeline, state).await
+    run_request_pipeline(RequestPhase::Body, pipeline, state).await
 }
 
 /// Handle response headers: run response filters and respond with mutations.
@@ -410,11 +410,10 @@ async fn handle_response_headers(
     state.response = Some(adapter::envoy_headers_to_response(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_response_headers_pipeline(pipeline, state).await;
+        return run_response_pipeline(ResponsePhase::Headers, pipeline, state).await;
     }
 
-    let mutation = run_response_header_filters(pipeline, state).await?;
-    Ok(vec![response::response_headers(mutation)])
+    run_response_header_filters_early(pipeline, state).await
 }
 
 /// Handle response body: accumulate chunks, run pipeline on EOS.
@@ -434,50 +433,32 @@ async fn handle_response_body(
         return Ok(Vec::new());
     }
 
-    run_response_body_pipeline(pipeline, state).await
+    run_response_pipeline(ResponsePhase::Body, pipeline, state).await
 }
 
 // -----------------------------------------------------------------------------
 // Pipeline Execution
 // -----------------------------------------------------------------------------
 
-/// Run request pipeline from headers phase (headers EOS=true).
-///
-/// Returns headers response with mutations.
-async fn run_request_headers_pipeline(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.request.is_none() {
-        return Err(Status::internal("no request headers"));
-    }
-
-    run_request_filters_for_headers(pipeline, state).await
+/// Request filter execution phase.
+#[derive(Debug, Clone, Copy)]
+enum RequestPhase {
+    /// Headers phase (headers EOS=true).
+    Headers,
+    /// Body phase (body EOS=true).
+    Body,
 }
 
-/// Run request pipeline from body phase (body EOS=true).
+/// Execute request pipeline for the given phase.
 ///
-/// Returns body response with mutations, even if body is empty.
-async fn run_request_body_pipeline(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.request.is_none() {
-        return Err(Status::internal("no request headers"));
-    }
-
-    run_request_filters_for_body(pipeline, state).await
-}
-
-/// Execute request-phase filters for headers phase (headers EOS=true).
-///
-/// Returns headers response with mutations.
-async fn run_request_filters_for_headers(
+/// Returns headers or body response with mutations.
+async fn run_request_pipeline(
+    phase: RequestPhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        return Err(Status::internal("no request headers"));
+        return Err(Status::invalid_argument("request headers not received"));
     };
     let mut ctx = adapter::build_filter_context(pipeline, request);
 
@@ -497,156 +478,113 @@ async fn run_request_filters_for_headers(
     state.branch_iterations = mem::take(&mut ctx.branch_iterations);
     state.filter_metadata = mem::take(&mut ctx.filter_metadata);
 
-    Ok(vec![response::request_headers(mutation)])
+    match phase {
+        RequestPhase::Headers => Ok(vec![response::request_headers(mutation)]),
+        RequestPhase::Body => {
+            let body_data = body_data_if_present(&state.request_body);
+            Ok(response::request_body(
+                body_data,
+                mutation,
+                state.protocol_config.request_body_mode,
+            ))
+        },
+    }
 }
 
-/// Execute request-phase filters for body phase (body EOS=true).
+/// Response filter execution phase.
+#[derive(Debug, Clone, Copy)]
+enum ResponsePhase {
+    /// Headers phase (response headers EOS=true).
+    Headers,
+    /// Body phase (response body EOS=true).
+    Body,
+}
+
+/// Execute response pipeline for the given phase.
 ///
-/// Returns body response with mutations, even if body is empty.
-async fn run_request_filters_for_body(
+/// Returns headers or body response with mutations.
+#[expect(clippy::too_many_lines, reason = "context borrowing prevents extraction")]
+async fn run_response_pipeline(
+    phase: ResponsePhase,
     pipeline: &FilterPipeline,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        return Err(Status::internal("no request headers"));
+        return Err(Status::invalid_argument("request headers not received"));
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
-
-    let action = execute_request(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
-        return Ok(vec![response::immediate(imm)]);
-    }
-
-    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body).await?;
-    if let Some(imm) = body_reject {
-        return Ok(vec![response::immediate(imm)]);
-    }
-
-    let mutation = adapter::collect_request_header_mutations(&ctx);
-    let body_data = body_data_if_present(&state.request_body);
-
-    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
-    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
-    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
-
-    // Always return body response in body phase, even for empty bodies
-    Ok(response::request_body(
-        body_data,
-        mutation,
-        state.protocol_config.request_body_mode,
-    ))
-}
-
-/// Run response pipeline from headers phase (response headers EOS=true).
-///
-/// Returns headers response with mutations.
-async fn run_response_headers_pipeline(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.request.is_none() {
-        return Err(Status::internal("no request headers"));
-    }
 
     let mut resp = state
         .response
         .take()
-        .ok_or_else(|| Status::internal("no response headers"))?;
+        .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
 
-    run_response_filters_for_headers(pipeline, state, &mut resp).await
-}
-
-/// Run response pipeline from body phase (response body EOS=true).
-///
-/// Returns body response with mutations, even if body is empty.
-async fn run_response_body_pipeline(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    if state.request.is_none() {
-        return Err(Status::internal("no request headers"));
-    }
-
-    let mut resp = state
-        .response
-        .take()
-        .ok_or_else(|| Status::internal("no response headers"))?;
-
-    run_response_filters_for_body(pipeline, state, &mut resp).await
-}
-
-/// Execute response-phase filters for headers phase (response headers EOS=true).
-///
-/// Returns headers response with mutations.
-async fn run_response_filters_for_headers(
-    pipeline: &FilterPipeline,
-    state: &mut StreamState,
-    resp: &mut Response,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    let Some(request) = state.request.as_ref() else {
-        return Err(Status::internal("no request headers"));
-    };
     let mut ctx = adapter::build_filter_context(pipeline, request);
-
     state.restore_request_ctx(&mut ctx);
-    let original_headers = capture_original_headers(resp);
-    ctx.response_header = Some(resp);
+    let original_headers = capture_original_headers(&resp);
+    ctx.response_header = Some(&mut resp);
 
-    let action = execute_response(pipeline, &mut ctx).await?;
-    if let Some(imm) = check_reject(action) {
-        return Ok(vec![response::immediate(imm)]);
-    }
-
-    let body_reject = run_resp_body_filters(pipeline, &mut ctx, &mut state.response_body)?;
-    if let Some(imm) = body_reject {
-        return Ok(vec![response::immediate(imm)]);
+    if let Some(rejection) = execute_response_pipeline_and_body_filters(
+        phase,
+        pipeline,
+        &mut ctx,
+        &mut state.response_body,
+        state.response_filters_executed,
+    )
+    .await?
+    {
+        return Ok(vec![response::immediate(rejection)]);
     }
 
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
-    Ok(vec![response::response_headers(mutation)])
+    Ok(build_response_for_phase(
+        phase,
+        mutation,
+        &state.response_body,
+        state.protocol_config.response_body_mode,
+    ))
 }
 
-/// Execute response-phase filters for body phase (response body EOS=true).
+/// Execute response pipeline and body filters, checking for rejections.
 ///
-/// Returns body response with mutations, even if body is empty.
-/// Skips response filter re-execution when headers were already
-/// processed by [`run_response_header_filters`]; only body filters run in that case.
-async fn run_response_filters_for_body(
+/// Returns `Some(ImmediateResponse)` if filters reject the request.
+async fn execute_response_pipeline_and_body_filters(
+    phase: ResponsePhase,
     pipeline: &FilterPipeline,
-    state: &mut StreamState,
-    resp: &mut Response,
-) -> Result<Vec<ProcessingResponse>, Status> {
-    let Some(request) = state.request.as_ref() else {
-        return Err(Status::internal("no request headers"));
+    ctx: &mut HttpFilterContext<'_>,
+    response_body: &mut Vec<u8>,
+    filters_executed: bool,
+) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
+    let should_execute = match phase {
+        ResponsePhase::Headers => true,
+        ResponsePhase::Body => !filters_executed,
     };
-    let mut ctx = adapter::build_filter_context(pipeline, request);
 
-    state.restore_request_ctx(&mut ctx);
-    let original_headers = capture_original_headers(resp);
-    ctx.response_header = Some(resp);
-
-    if !state.response_filters_executed {
-        let action = execute_response(pipeline, &mut ctx).await?;
+    if should_execute {
+        let action = execute_response(pipeline, ctx).await?;
         if let Some(imm) = check_reject(action) {
-            return Ok(vec![response::immediate(imm)]);
+            return Ok(Some(imm));
         }
     }
 
-    let body_reject = run_resp_body_filters(pipeline, &mut ctx, &mut state.response_body)?;
-    if let Some(imm) = body_reject {
-        return Ok(vec![response::immediate(imm)]);
+    let body_reject = run_resp_body_filters(pipeline, ctx, response_body)?;
+    Ok(body_reject)
+}
+
+/// Build appropriate response based on phase.
+fn build_response_for_phase(
+    phase: ResponsePhase,
+    mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    response_body: &[u8],
+    body_mode: BodyMode,
+) -> Vec<ProcessingResponse> {
+    match phase {
+        ResponsePhase::Headers => vec![response::response_headers(mutation)],
+        ResponsePhase::Body => {
+            let body_data = body_data_if_present(response_body);
+            response::response_body(body_data, mutation, body_mode)
+        },
     }
-
-    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
-    let body_data = body_data_if_present(&state.response_body);
-
-    // Always return body response in body phase, even for empty bodies
-    Ok(response::response_body(
-        body_data,
-        mutation,
-        state.protocol_config.response_body_mode,
-    ))
 }
 
 /// Run response filters at header time and return header mutations.
@@ -654,18 +592,19 @@ async fn run_response_filters_for_body(
 /// This executes the response pipeline early so mutations can be
 /// included in the `ResponseHeaders` reply. Body processing runs
 /// separately when the body arrives.
-async fn run_response_header_filters(
+async fn run_response_header_filters_early(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
-) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>, Status> {
+) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
-        return Ok(None);
+        return Ok(vec![response::response_headers(None)]);
     };
+
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
 
     let Some(resp) = state.response.as_mut() else {
-        return Ok(None);
+        return Ok(vec![response::response_headers(None)]);
     };
 
     let original_headers = capture_original_headers(resp);
@@ -677,8 +616,9 @@ async fn run_response_header_filters(
     }
 
     state.response_filters_executed = true;
+    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
-    Ok(adapter::collect_response_header_mutations_diff(&ctx, &original_headers))
+    Ok(vec![response::response_headers(mutation)])
 }
 
 /// Capture response header names and values before filter execution.
