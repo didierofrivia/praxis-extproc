@@ -18,6 +18,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures::StreamExt as _;
 use openssl::{
     pkey::PKey,
     ssl::{AlpnError, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslVerifyMode, select_next_proto},
@@ -27,12 +28,8 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
 };
-use tokio_stream::{
-    Stream, StreamExt as _,
-    wrappers::{ReceiverStream, TcpListenerStream},
-};
+use tokio_stream::{Stream, wrappers::TcpListenerStream};
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::info;
 
@@ -161,41 +158,41 @@ pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<SslAccep
     }
 }
 
-/// Maximum number of TLS handshakes that may be in-flight simultaneously.
-const HANDSHAKE_CONCURRENCY: usize = 64;
+/// Maximum number of TLS handshakes running concurrently via `buffer_unordered`.
+///
+/// When all slots are occupied the accept loop stalls until one completes
+/// or times out, providing natural back-pressure on new connections.
+pub const HANDSHAKE_CONCURRENCY: usize = 64;
+
+/// Maximum duration allowed for a single TLS handshake.
+///
+/// Connections that stall during the handshake are dropped after this
+/// deadline, freeing their slot for the next accept.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Build a stream of TLS-wrapped connections from a bound [`TcpListener`].
 ///
-/// Each accepted TCP connection has its TLS handshake performed in an
-/// independent [`tokio::spawn`]ed task, so a slow or stalled handshake
-/// does not block subsequent accepts. Up to `HANDSHAKE_CONCURRENCY`
-/// handshakes may be in-flight at once. The stream ends when the
-/// [`TcpListener`] closes or the caller drops the returned stream.
+/// Up to `concurrency` handshakes run concurrently via `buffer_unordered`;
+/// the accept loop stalls naturally when all slots are taken. Each handshake
+/// is bounded by `timeout`: a stalled client is dropped and its slot freed
+/// without blocking other accepts.
 pub fn build_tls_incoming(
     listener: TcpListener,
     acceptor: SslAcceptor,
+    concurrency: usize,
+    timeout: std::time::Duration,
 ) -> impl Stream<Item = Result<OpenSslStream, io::Error>> {
     let acceptor = Arc::new(acceptor);
-    let (tx, rx) = mpsc::channel(HANDSHAKE_CONCURRENCY);
-    let tx_watch = tx.clone();
-    tokio::spawn(async move {
-        let mut tcp = TcpListenerStream::new(listener);
-        loop {
-            tokio::select! {
-                () = tx_watch.closed() => break,
-                maybe = tcp.next() => {
-                    let Some(result) = maybe else { break };
-                    let acceptor = Arc::clone(&acceptor);
-                    let tx_inner = tx.clone();
-                    tokio::spawn(async move {
-                        let outcome = perform_handshake(result, acceptor).await;
-                        let Ok(()) = tx_inner.send(outcome).await else { return };
-                    });
-                }
+    TcpListenerStream::new(listener)
+        .map(move |result| {
+            let acceptor = Arc::clone(&acceptor);
+            async move {
+                tokio::time::timeout(timeout, perform_handshake(result, acceptor))
+                    .await
+                    .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")))
             }
-        }
-    });
-    ReceiverStream::new(rx)
+        })
+        .buffer_unordered(concurrency)
 }
 
 /// Perform a TLS handshake on an accepted TCP connection.
@@ -314,6 +311,8 @@ fn set_alpn_h2(builder: &mut SslAcceptorBuilder) -> crate::error::Result<()> {
     reason = "tests"
 )]
 mod tests {
+    use std::{io, time::Duration};
+
     use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tonic::transport::server::Connected as _;
@@ -350,7 +349,7 @@ mod tests {
     async fn build_tls_incoming_accepts_connection_and_exchanges_data() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let mut incoming = build_tls_incoming(listener, make_test_acceptor());
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor(), HANDSHAKE_CONCURRENCY, HANDSHAKE_TIMEOUT);
 
         let server = tokio::spawn(async move {
             let mut stream = incoming.next().await.expect("stream item").expect("no TLS error");
@@ -372,6 +371,49 @@ mod tests {
 
         server.await.expect("server task");
         client.await.expect("client task");
+    }
+
+    #[tokio::test]
+    async fn build_tls_incoming_timeout_drops_stalled_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let timeout = Duration::from_millis(100);
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor(), 1, timeout);
+
+        // Connect raw TCP but never send a TLS ClientHello — this stalls the handshake.
+        let _stall = TcpStream::connect(addr).await.expect("stall connect");
+
+        let result = incoming.next().await.expect("should yield an item");
+        assert!(result.is_err(), "stalled handshake should produce an error");
+        let err = result.err().expect("checked: is_err() was true");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "error kind should be TimedOut");
+    }
+
+    #[tokio::test]
+    async fn build_tls_incoming_concurrency_holds_back_pressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let timeout = Duration::from_millis(150);
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor(), 1, timeout);
+
+        // Occupy the single slot with a stalling connection.
+        let _stall = TcpStream::connect(addr).await.expect("stall connect");
+
+        // Legitimate client connects; TCP handshake completes in the OS backlog
+        // but our accept loop cannot proceed until the slot is freed.
+        let client = tokio::spawn(async move { connect_test_client(addr).await });
+
+        // First item: the stalling connection times out.
+        let first = incoming.next().await.expect("first item");
+        assert!(first.is_err(), "stalled connection should time out");
+        let first_err = first.err().expect("checked: is_err()");
+        assert_eq!(first_err.kind(), io::ErrorKind::TimedOut, "should be timeout");
+
+        // Second item: slot freed, legitimate client accepted and handshake succeeds.
+        let second = incoming.next().await.expect("second item");
+        assert!(second.is_ok(), "legitimate client should succeed after slot frees");
+
+        drop(client.await.expect("client task"));
     }
 
     #[test]

@@ -156,7 +156,7 @@ async fn serve_tls(
     acceptor: openssl::ssl::SslAcceptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let incoming = tls::build_tls_incoming(listener, acceptor);
+    let incoming = tls::build_tls_incoming(listener, acceptor, tls::HANDSHAKE_CONCURRENCY, tls::HANDSHAKE_TIMEOUT);
     Box::pin(
         Server::builder()
             .add_service(svc)
