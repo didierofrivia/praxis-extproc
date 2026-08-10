@@ -172,10 +172,15 @@ async fn process_messages(
     while let Some(result) = inbound.next().await {
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
 
-        if !first_message_processed {
-            config_from_first_message(stream_state, msg.protocol_config);
-            first_message_processed = true;
+        if let Some(proto_cfg) = msg.protocol_config {
+            if first_message_processed {
+                return Err(Status::invalid_argument(
+                    "protocol_config may only be sent on the first stream message",
+                ));
+            }
+            config_from_first_message(stream_state, proto_cfg)?;
         }
+        first_message_processed = true;
 
         let Some(req) = msg.request else {
             warn!("received ProcessingRequest with no request field");
@@ -199,23 +204,18 @@ async fn process_messages(
     Ok(())
 }
 
-/// Parses `protocol_config` from first message
+/// Parses `protocol_config` from first message.
 ///
 /// # Errors
 ///
 /// Returns [`Status::invalid_argument`] if unsupported body modes are requested.
-fn config_from_first_message(
-    stream_state: &mut StreamState,
-    protocol_config: Option<ProtocolConfiguration>,
-) -> Result<(), Status> {
-    if let Some(proto_cfg) = protocol_config {
-        stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(Status::invalid_argument)?;
-        debug!(
-            request_mode = ?stream_state.protocol_config.request_body_mode,
-            response_mode = ?stream_state.protocol_config.response_body_mode,
-            "ExtProc protocol configuration received from Envoy"
-        );
-    }
+fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: ProtocolConfiguration) -> Result<(), Status> {
+    stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(Status::invalid_argument)?;
+    debug!(
+        request_mode = ?stream_state.protocol_config.request_body_mode,
+        response_mode = ?stream_state.protocol_config.response_body_mode,
+        "ExtProc protocol configuration received from Envoy"
+    );
     Ok(())
 }
 
