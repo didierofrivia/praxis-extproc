@@ -137,6 +137,16 @@ impl TlsConfig {
     ///
     /// Returns an error naming the offending field and the active mode.
     pub fn validate(&self) -> crate::error::Result<()> {
+        if self.handshake_concurrency == 0 {
+            return Err(crate::error::ExtProcError::Config(
+                "tls.handshake_concurrency must be greater than zero".to_owned(),
+            ));
+        }
+        if self.handshake_timeout_secs == 0 {
+            return Err(crate::error::ExtProcError::Config(
+                "tls.handshake_timeout_secs must be greater than zero".to_owned(),
+            ));
+        }
         if matches!(self.mode, TlsMode::Provided) {
             return Ok(());
         }
@@ -497,6 +507,33 @@ mod tests {
         assert!(second.is_ok(), "legitimate client should succeed after slot frees");
 
         drop(client.await.expect("client task"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_handshake_concurrency() {
+        let cfg = TlsConfig {
+            handshake_concurrency: 0,
+            ..TlsConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(result.is_err(), "zero concurrency should error");
+        let err = result.expect_err("checked: is_err()");
+        assert!(
+            err.to_string().contains("concurrency"),
+            "error should mention concurrency"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_handshake_timeout() {
+        let cfg = TlsConfig {
+            handshake_timeout_secs: 0,
+            ..TlsConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(result.is_err(), "zero timeout should error");
+        let err = result.expect_err("checked: is_err()");
+        assert!(err.to_string().contains("timeout"), "error should mention timeout");
     }
 
     #[test]
