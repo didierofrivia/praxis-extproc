@@ -131,7 +131,7 @@ async fn serve_grpc(
     let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
     match tls::build_tls_config(tls_cfg)? {
         None => Box::pin(serve_plaintext(addr, svc)).await,
-        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor)).await,
+        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,
     }
 }
 
@@ -154,9 +154,11 @@ async fn serve_tls(
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
     acceptor: openssl::ssl::SslAcceptor,
+    tls_cfg: &tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let incoming = tls::build_tls_incoming(listener, acceptor, tls::HANDSHAKE_CONCURRENCY, tls::HANDSHAKE_TIMEOUT);
+    let timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs);
+    let incoming = tls::build_tls_incoming(listener, acceptor, tls_cfg.handshake_concurrency, timeout);
     Box::pin(
         Server::builder()
             .add_service(svc)

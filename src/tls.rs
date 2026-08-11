@@ -11,6 +11,7 @@
 //! mTLS client certificate verification is supported via `ca_cert_path`.
 
 use std::{
+    fmt,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -59,6 +60,16 @@ pub enum TlsMode {
     None,
 }
 
+impl fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::SelfSigned => f.write_str("self_signed"),
+            Self::Provided => f.write_str("provided"),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // TlsConfig
 // -----------------------------------------------------------------------------
@@ -71,7 +82,7 @@ pub enum TlsMode {
 /// let cfg = TlsConfig::default();
 /// assert!(matches!(cfg.mode, praxis_extproc::tls::TlsMode::None));
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TlsConfig {
     /// Which TLS mode to use.
@@ -88,6 +99,66 @@ pub struct TlsConfig {
     /// When set, the server requires clients to present a valid certificate
     /// signed by this CA (`provided` mode only).
     pub ca_cert_path: Option<String>,
+
+    /// Maximum number of concurrent TLS handshakes.
+    ///
+    /// Defaults to [`HANDSHAKE_CONCURRENCY`]. When all slots are occupied
+    /// the accept loop stalls, providing natural back-pressure.
+    #[serde(default = "default_handshake_concurrency")]
+    pub handshake_concurrency: usize,
+
+    /// Maximum duration in seconds allowed for a single TLS handshake.
+    ///
+    /// Defaults to [`HANDSHAKE_TIMEOUT`] in seconds. Stalled connections are
+    /// dropped after this deadline, freeing their slot immediately.
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: TlsMode::None,
+            cert_path: None,
+            key_path: None,
+            ca_cert_path: None,
+            handshake_concurrency: HANDSHAKE_CONCURRENCY,
+            handshake_timeout_secs: HANDSHAKE_TIMEOUT.as_secs(),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Validate that no path fields are set for a mode that does not use them.
+    ///
+    /// Prevents silent misconfiguration — for example, setting `ca_cert_path`
+    /// while `mode` is `self_signed` would otherwise be silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the offending field and the active mode.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if matches!(self.mode, TlsMode::Provided) {
+            return Ok(());
+        }
+        let mode = &self.mode;
+        if self.cert_path.is_some() {
+            return Err(crate::error::ExtProcError::Config(format!(
+                "tls.cert_path is not used in `{mode}` mode"
+            )));
+        }
+        if self.key_path.is_some() {
+            return Err(crate::error::ExtProcError::Config(format!(
+                "tls.key_path is not used in `{mode}` mode"
+            )));
+        }
+        if self.ca_cert_path.is_some() {
+            return Err(crate::error::ExtProcError::Config(format!(
+                "tls.ca_cert_path is not used in `{mode}` mode"
+            )));
+        }
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -152,40 +223,22 @@ impl AsyncWrite for OpenSslStream {
 /// does not use them, if cert/key/CA files cannot be read, or if
 /// self-signed certificate generation or `OpenSSL` setup fails.
 pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<SslAcceptor>> {
+    cfg.validate()?;
     match cfg.mode {
-        TlsMode::None => {
-            validate_no_path_fields("none", cfg)?;
-            Ok(None)
-        },
-        TlsMode::SelfSigned => {
-            validate_no_path_fields("self_signed", cfg)?;
-            build_self_signed().map(Some)
-        },
+        TlsMode::None => Ok(None),
+        TlsMode::SelfSigned => build_self_signed().map(Some),
         TlsMode::Provided => build_provided(cfg).map(Some),
     }
 }
 
-/// Reject any path fields that are set but unused in the given mode.
-///
-/// Prevents silent misconfiguration where a user sets e.g. `ca_cert_path`
-/// expecting mTLS but the active mode ignores it.
-fn validate_no_path_fields(mode: &'static str, cfg: &TlsConfig) -> crate::error::Result<()> {
-    if cfg.cert_path.is_some() {
-        return Err(crate::error::ExtProcError::Config(format!(
-            "tls.cert_path is not used in `{mode}` mode"
-        )));
-    }
-    if cfg.key_path.is_some() {
-        return Err(crate::error::ExtProcError::Config(format!(
-            "tls.key_path is not used in `{mode}` mode"
-        )));
-    }
-    if cfg.ca_cert_path.is_some() {
-        return Err(crate::error::ExtProcError::Config(format!(
-            "tls.ca_cert_path is not used in `{mode}` mode"
-        )));
-    }
-    Ok(())
+/// Returns the default maximum number of concurrent TLS handshakes for serde.
+const fn default_handshake_concurrency() -> usize {
+    HANDSHAKE_CONCURRENCY
+}
+
+/// Returns the default TLS handshake timeout in seconds for serde.
+const fn default_handshake_timeout_secs() -> u64 {
+    HANDSHAKE_TIMEOUT.as_secs()
 }
 
 /// Maximum number of TLS handshakes running concurrently via `buffer_unordered`.
@@ -352,9 +405,7 @@ mod tests {
     fn make_test_acceptor() -> SslAcceptor {
         build_tls_config(&TlsConfig {
             mode: TlsMode::SelfSigned,
-            cert_path: None,
-            key_path: None,
-            ca_cert_path: None,
+            ..TlsConfig::default()
         })
         .expect("build_tls_config")
         .expect("SelfSigned should return Some acceptor")
@@ -449,10 +500,8 @@ mod tests {
     #[test]
     fn none_mode_rejects_cert_path() {
         let cfg = TlsConfig {
-            mode: TlsMode::None,
             cert_path: Some("/some/cert.pem".to_owned()),
-            key_path: None,
-            ca_cert_path: None,
+            ..TlsConfig::default()
         };
         let result = build_tls_config(&cfg);
         assert!(result.is_err(), "none mode with cert_path should error");
@@ -464,9 +513,8 @@ mod tests {
     fn self_signed_mode_rejects_ca_cert_path() {
         let cfg = TlsConfig {
             mode: TlsMode::SelfSigned,
-            cert_path: None,
-            key_path: None,
             ca_cert_path: Some("/some/ca.pem".to_owned()),
+            ..TlsConfig::default()
         };
         let result = build_tls_config(&cfg);
         assert!(result.is_err(), "self_signed mode with ca_cert_path should error");
@@ -488,9 +536,7 @@ mod tests {
     fn self_signed_mode_returns_some() {
         let cfg = TlsConfig {
             mode: TlsMode::SelfSigned,
-            cert_path: None,
-            key_path: None,
-            ca_cert_path: None,
+            ..TlsConfig::default()
         };
         let result = build_tls_config(&cfg).expect("should succeed");
         assert!(result.is_some(), "SelfSigned mode should return Some");
@@ -500,9 +546,8 @@ mod tests {
     fn provided_mode_missing_cert_path_errors() {
         let cfg = TlsConfig {
             mode: TlsMode::Provided,
-            cert_path: None,
             key_path: Some("/tmp/key.pem".to_owned()),
-            ca_cert_path: None,
+            ..TlsConfig::default()
         };
         let result = build_tls_config(&cfg);
         assert!(result.is_err(), "missing cert_path should error");
@@ -515,8 +560,7 @@ mod tests {
         let cfg = TlsConfig {
             mode: TlsMode::Provided,
             cert_path: Some("/tmp/cert.pem".to_owned()),
-            key_path: None,
-            ca_cert_path: None,
+            ..TlsConfig::default()
         };
         let result = build_tls_config(&cfg);
         assert!(result.is_err(), "missing key_path should error");
@@ -530,7 +574,7 @@ mod tests {
             mode: TlsMode::Provided,
             cert_path: Some("/nonexistent/cert.pem".to_owned()),
             key_path: Some("/nonexistent/key.pem".to_owned()),
-            ca_cert_path: None,
+            ..TlsConfig::default()
         };
         assert!(build_tls_config(&cfg).is_err(), "nonexistent files should error");
     }
@@ -606,6 +650,7 @@ ca_cert_path: /etc/tls/ca.pem
             cert_path: Some(format!("{}", cert_path.display())),
             key_path: Some(format!("{}", key_path.display())),
             ca_cert_path: Some("/nonexistent/ca.pem".to_owned()),
+            ..TlsConfig::default()
         };
 
         let result = build_tls_config(&cfg);
@@ -633,6 +678,7 @@ ca_cert_path: /etc/tls/ca.pem
             cert_path: Some(format!("{}", cert_path.display())),
             key_path: Some(format!("{}", key_path.display())),
             ca_cert_path: Some(format!("{}", ca_path.display())),
+            ..TlsConfig::default()
         };
 
         let result = build_tls_config(&cfg);
