@@ -5,9 +5,32 @@
 //!
 //! Supports three modes: self-signed (ephemeral cert), provided
 //! (cert and key from disk), and plaintext (no TLS).
+//!
+//! TLS termination uses the [`openssl`] crate which delegates directly to
+//! system `OpenSSL`, enabling FIPS compliance via the OS crypto library.
+//! mTLS client certificate verification is supported via `ca_cert_path`.
 
+use std::{
+    fmt, io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
+
+use futures::StreamExt as _;
+use openssl::{
+    pkey::PKey,
+    ssl::{AlpnError, Ssl, SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod, SslVerifyMode, select_next_proto},
+    x509::X509,
+};
 use serde::Deserialize;
-use tonic::transport::{Identity, ServerTlsConfig};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream},
+};
+use tokio_stream::{Stream, wrappers::TcpListenerStream};
+use tonic::transport::server::{Connected, TcpConnectInfo};
 use tracing::info;
 
 // -----------------------------------------------------------------------------
@@ -36,6 +59,16 @@ pub enum TlsMode {
     None,
 }
 
+impl fmt::Display for TlsMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::SelfSigned => f.write_str("self_signed"),
+            Self::Provided => f.write_str("provided"),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // TlsConfig
 // -----------------------------------------------------------------------------
@@ -48,7 +81,7 @@ pub enum TlsMode {
 /// let cfg = TlsConfig::default();
 /// assert!(matches!(cfg.mode, praxis_extproc::tls::TlsMode::None));
 /// ```
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TlsConfig {
     /// Which TLS mode to use.
@@ -59,76 +92,306 @@ pub struct TlsConfig {
 
     /// Path to the PEM private key file (required for `provided` mode).
     pub key_path: Option<String>,
+
+    /// Path to a PEM CA certificate for mTLS client verification.
+    ///
+    /// When set, the server requires clients to present a valid certificate
+    /// signed by this CA (`provided` mode only).
+    pub ca_cert_path: Option<String>,
+
+    /// Maximum number of concurrent TLS handshakes.
+    ///
+    /// Defaults to [`HANDSHAKE_CONCURRENCY`]. When all slots are occupied
+    /// the accept loop stalls, providing natural back-pressure.
+    #[serde(default = "default_handshake_concurrency")]
+    pub handshake_concurrency: usize,
+
+    /// Maximum duration in seconds allowed for a single TLS handshake.
+    ///
+    /// Defaults to [`HANDSHAKE_TIMEOUT`] in seconds. Stalled connections are
+    /// dropped after this deadline, freeing their slot immediately.
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: TlsMode::None,
+            cert_path: None,
+            key_path: None,
+            ca_cert_path: None,
+            handshake_concurrency: HANDSHAKE_CONCURRENCY,
+            handshake_timeout_secs: HANDSHAKE_TIMEOUT.as_secs(),
+        }
+    }
+}
+
+impl TlsConfig {
+    /// Validate that no path fields are set for a mode that does not use them.
+    ///
+    /// Prevents silent misconfiguration — for example, setting `ca_cert_path`
+    /// while `mode` is `self_signed` would otherwise be silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the offending field and the active mode.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.handshake_concurrency == 0 {
+            return Err(crate::error::ExtProcError::Config(
+                "tls.handshake_concurrency must be greater than zero".to_owned(),
+            ));
+        }
+        if self.handshake_timeout_secs == 0 {
+            return Err(crate::error::ExtProcError::Config(
+                "tls.handshake_timeout_secs must be greater than zero".to_owned(),
+            ));
+        }
+        if matches!(self.mode, TlsMode::Provided) {
+            return Ok(());
+        }
+        let mode = &self.mode;
+        if self.cert_path.is_some() {
+            return Err(crate::error::ExtProcError::Config(format!(
+                "tls.cert_path is not used in `{mode}` mode"
+            )));
+        }
+        if self.key_path.is_some() {
+            return Err(crate::error::ExtProcError::Config(format!(
+                "tls.key_path is not used in `{mode}` mode"
+            )));
+        }
+        if self.ca_cert_path.is_some() {
+            return Err(crate::error::ExtProcError::Config(format!(
+                "tls.ca_cert_path is not used in `{mode}` mode"
+            )));
+        }
+        Ok(())
+    }
+}
+
+// -----------------------------------------------------------------------------
+// OpenSslStream
+// -----------------------------------------------------------------------------
+
+/// A TLS-wrapped [`TcpStream`] backed by `OpenSSL` that implements [`Connected`],
+/// [`AsyncRead`], and [`AsyncWrite`] for use with tonic's
+/// `serve_with_incoming_shutdown`.
+pub struct OpenSslStream {
+    /// Underlying async TLS stream.
+    inner: tokio_openssl::SslStream<TcpStream>,
+    /// Local socket address, captured before the TLS handshake.
+    local_addr: Option<SocketAddr>,
+    /// Remote socket address, captured before the TLS handshake.
+    remote_addr: Option<SocketAddr>,
+}
+
+impl Connected for OpenSslStream {
+    type ConnectInfo = TcpConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        TcpConnectInfo {
+            local_addr: self.local_addr,
+            remote_addr: self.remote_addr,
+        }
+    }
+}
+
+impl AsyncRead for OpenSslStream {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for OpenSslStream {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // -----------------------------------------------------------------------------
 // TLS Setup
 // -----------------------------------------------------------------------------
 
-/// Build a [`ServerTlsConfig`] from the TLS settings.
+/// Build an [`SslAcceptor`] from the TLS settings.
 ///
 /// Returns `None` for plaintext mode. Generates a self-signed cert
 /// or loads from disk depending on the mode.
 ///
 /// # Errors
 ///
-/// Returns an error if cert/key files cannot be read or if
-/// self-signed certificate generation fails.
-///
-/// [`ServerTlsConfig`]: tonic::transport::ServerTlsConfig
-pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfig>> {
+/// Returns an error if cert/key/CA path fields are set for a mode that
+/// does not use them, if cert/key/CA files cannot be read, or if
+/// self-signed certificate generation or `OpenSSL` setup fails.
+pub fn build_tls_config(cfg: &TlsConfig) -> crate::error::Result<Option<SslAcceptor>> {
+    cfg.validate()?;
     match cfg.mode {
         TlsMode::None => Ok(None),
-        TlsMode::SelfSigned => build_self_signed(),
-        TlsMode::Provided => build_provided(cfg),
+        TlsMode::SelfSigned => build_self_signed().map(Some),
+        TlsMode::Provided => build_provided(cfg).map(Some),
     }
 }
 
-/// Generate a self-signed certificate using `rcgen`.
-fn build_self_signed() -> crate::error::Result<Option<ServerTlsConfig>> {
-    info!("generating self-signed TLS certificate");
-
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .map_err(|e| crate::error::ExtProcError::Config(format!("self-signed cert: {e}")))?;
-
-    let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
-
-    let identity = Identity::from_pem(cert_pem, key_pem);
-    let tls_config = ServerTlsConfig::new().identity(identity);
-
-    Ok(Some(tls_config))
+/// Returns the default maximum number of concurrent TLS handshakes for serde.
+const fn default_handshake_concurrency() -> usize {
+    HANDSHAKE_CONCURRENCY
 }
 
-/// Load certificate and key from disk.
+/// Returns the default TLS handshake timeout in seconds for serde.
+const fn default_handshake_timeout_secs() -> u64 {
+    HANDSHAKE_TIMEOUT.as_secs()
+}
+
+/// Maximum number of TLS handshakes running concurrently via `buffer_unordered`.
+///
+/// When all slots are occupied the accept loop stalls until one completes
+/// or times out, providing natural back-pressure on new connections.
+pub const HANDSHAKE_CONCURRENCY: usize = 64;
+
+/// Maximum duration allowed for a single TLS handshake.
+///
+/// Connections that stall during the handshake are dropped after this
+/// deadline, freeing their slot for the next accept.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build a stream of TLS-wrapped connections from a bound [`TcpListener`].
+///
+/// Up to `concurrency` handshakes run concurrently via `buffer_unordered`;
+/// the accept loop stalls naturally when all slots are taken. Each handshake
+/// is bounded by `timeout`: a stalled client is dropped and its slot freed
+/// without blocking other accepts.
+pub fn build_tls_incoming(
+    listener: TcpListener,
+    acceptor: SslAcceptor,
+    concurrency: usize,
+    timeout: std::time::Duration,
+) -> impl Stream<Item = Result<OpenSslStream, io::Error>> {
+    let acceptor = Arc::new(acceptor);
+    TcpListenerStream::new(listener)
+        .map(move |result| {
+            let acceptor = Arc::clone(&acceptor);
+            async move {
+                tokio::time::timeout(timeout, perform_handshake(result, acceptor))
+                    .await
+                    .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")))
+            }
+        })
+        .buffer_unordered(concurrency)
+}
+
+/// Perform a TLS handshake on an accepted TCP connection.
+///
+/// Wraps `result` in an [`OpenSslStream`], capturing socket addresses
+/// before the handshake so [`Connected::connect_info`] is always populated.
 ///
 /// # Errors
 ///
-/// Returns an error if `cert_path` or `key_path` is missing, or
-/// if the files cannot be read.
-fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfig>> {
+/// Returns an error if the TCP accept, SSL context creation, or TLS
+/// handshake fails.
+async fn perform_handshake(
+    result: Result<TcpStream, io::Error>,
+    acceptor: Arc<SslAcceptor>,
+) -> Result<OpenSslStream, io::Error> {
+    let stream = result?;
+    let local_addr = stream.local_addr().ok();
+    let remote_addr = stream.peer_addr().ok();
+    let ssl = Ssl::new(acceptor.context()).map_err(io::Error::other)?;
+    let mut tls = tokio_openssl::SslStream::new(ssl, stream).map_err(io::Error::other)?;
+    Pin::new(&mut tls)
+        .accept()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, e))?;
+    Ok(OpenSslStream {
+        inner: tls,
+        local_addr,
+        remote_addr,
+    })
+}
+
+/// Generate an ephemeral self-signed certificate using `rcgen`.
+fn build_self_signed() -> crate::error::Result<SslAcceptor> {
+    info!("generating self-signed TLS certificate");
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .map_err(|e| crate::error::ExtProcError::Config(format!("self-signed cert: {e}")))?;
+    let x509 = X509::from_pem(cert.cert.pem().as_bytes())
+        .map_err(|e| crate::error::ExtProcError::Config(format!("X509: {e}")))?;
+    let pkey = PKey::private_key_from_pem(cert.key_pair.serialize_pem().as_bytes())
+        .map_err(|e| crate::error::ExtProcError::Config(format!("private key: {e}")))?;
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+        .map_err(|e| crate::error::ExtProcError::Config(format!("SSL context: {e}")))?;
+    builder
+        .set_certificate(&x509)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("set certificate: {e}")))?;
+    builder
+        .set_private_key(&pkey)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("set private key: {e}")))?;
+    set_alpn_h2(&mut builder)?;
+    Ok(builder.build())
+}
+
+/// Load certificate and key from disk, optionally configuring mTLS.
+///
+/// When `ca_cert_path` is set the server requires clients to present a
+/// certificate signed by that CA (`PEER | FAIL_IF_NO_PEER_CERT`).
+///
+/// # Errors
+///
+/// Returns an error if `cert_path` or `key_path` is missing, if any
+/// file cannot be read, or if `OpenSSL` setup fails.
+fn build_provided(cfg: &TlsConfig) -> crate::error::Result<SslAcceptor> {
     let cert_path = cfg
         .cert_path
         .as_deref()
         .ok_or_else(|| crate::error::ExtProcError::Config("tls.cert_path required for provided mode".to_owned()))?;
-
     let key_path = cfg
         .key_path
         .as_deref()
         .ok_or_else(|| crate::error::ExtProcError::Config("tls.key_path required for provided mode".to_owned()))?;
-
     info!(cert = cert_path, key = key_path, "loading TLS certificate");
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
+        .map_err(|e| crate::error::ExtProcError::Config(format!("SSL context: {e}")))?;
+    builder
+        .set_certificate_chain_file(cert_path)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("certificate: {e}")))?;
+    builder
+        .set_private_key_file(key_path, SslFiletype::PEM)
+        .map_err(|e| crate::error::ExtProcError::Config(format!("private key: {e}")))?;
+    builder
+        .check_private_key()
+        .map_err(|e| crate::error::ExtProcError::Config(format!("cert/key mismatch: {e}")))?;
+    set_alpn_h2(&mut builder)?;
+    if let Some(ca_path) = &cfg.ca_cert_path {
+        info!(ca = ca_path, "enabling mTLS client verification");
+        builder
+            .set_ca_file(ca_path)
+            .map_err(|e| crate::error::ExtProcError::Config(format!("CA cert: {e}")))?;
+        builder.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    }
+    Ok(builder.build())
+}
 
-    let cert_pem =
-        std::fs::read(cert_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {cert_path}: {e}")))?;
-
-    let key_pem =
-        std::fs::read(key_path).map_err(|e| crate::error::ExtProcError::Config(format!("read {key_path}: {e}")))?;
-
-    let identity = Identity::from_pem(cert_pem, key_pem);
-    let tls_config = ServerTlsConfig::new().identity(identity);
-
-    Ok(Some(tls_config))
+/// Configure H2 ALPN on the provided [`SslAcceptorBuilder`].
+///
+/// Sets `h2` as the only advertised protocol and installs a selection
+/// callback that honours client preference via [`select_next_proto`].
+///
+/// # Errors
+///
+/// Returns an error if the `OpenSSL` ALPN protos call fails.
+fn set_alpn_h2(builder: &mut SslAcceptorBuilder) -> crate::error::Result<()> {
+    builder
+        .set_alpn_protos(b"\x02h2")
+        .map_err(|e| crate::error::ExtProcError::Config(format!("ALPN protos: {e}")))?;
+    builder.set_alpn_select_callback(|_ssl, client| select_next_proto(b"\x02h2", client).ok_or(AlpnError::NOACK));
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -143,7 +406,169 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<Option<ServerTlsConfi
     reason = "tests"
 )]
 mod tests {
+    use std::{io, time::Duration};
+
+    use openssl::ssl::{SslAcceptor, SslConnector, SslMethod, SslVerifyMode};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tonic::transport::server::Connected as _;
+
     use super::*;
+
+    fn make_test_acceptor() -> SslAcceptor {
+        build_tls_config(&TlsConfig {
+            mode: TlsMode::SelfSigned,
+            ..TlsConfig::default()
+        })
+        .expect("build_tls_config")
+        .expect("SelfSigned should return Some acceptor")
+    }
+
+    async fn connect_test_client(addr: SocketAddr) -> tokio_openssl::SslStream<TcpStream> {
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        finish_tls_client(tcp).await
+    }
+
+    async fn finish_tls_client(tcp: TcpStream) -> tokio_openssl::SslStream<TcpStream> {
+        let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector builder");
+        builder.set_verify(SslVerifyMode::NONE);
+        let connector = builder.build();
+        let ssl = connector
+            .configure()
+            .expect("configure")
+            .into_ssl("localhost")
+            .expect("into_ssl");
+        let mut tls = tokio_openssl::SslStream::new(ssl, tcp).expect("SslStream::new");
+        Pin::new(&mut tls).connect().await.expect("TLS handshake");
+        tls
+    }
+
+    #[tokio::test]
+    async fn build_tls_incoming_accepts_connection_and_exchanges_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor(), HANDSHAKE_CONCURRENCY, HANDSHAKE_TIMEOUT);
+
+        let server = tokio::spawn(async move {
+            let mut stream = incoming.next().await.expect("stream item").expect("no TLS error");
+            let info = stream.connect_info();
+            assert!(info.local_addr.is_some(), "local addr should be populated");
+            assert!(info.remote_addr.is_some(), "remote addr should be populated");
+            let mut buf = [0_u8; 5];
+            stream.read_exact(&mut buf).await.expect("server read");
+            stream.write_all(&buf).await.expect("server write");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut tls = connect_test_client(addr).await;
+            tls.write_all(b"hello").await.expect("client write");
+            let mut buf = [0_u8; 5];
+            tls.read_exact(&mut buf).await.expect("client read");
+            assert_eq!(&buf, b"hello", "echoed bytes must match");
+        });
+
+        server.await.expect("server task");
+        client.await.expect("client task");
+    }
+
+    #[tokio::test]
+    async fn build_tls_incoming_timeout_drops_stalled_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let timeout = Duration::from_millis(100);
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor(), 1, timeout);
+
+        // Connect raw TCP but never send a TLS ClientHello — this stalls the handshake.
+        let _stall = TcpStream::connect(addr).await.expect("stall connect");
+
+        let result = incoming.next().await.expect("should yield an item");
+        assert!(result.is_err(), "stalled handshake should produce an error");
+        let err = result.err().expect("checked: is_err() was true");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "error kind should be TimedOut");
+    }
+
+    #[tokio::test]
+    async fn build_tls_incoming_concurrency_holds_back_pressure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let timeout = Duration::from_millis(150);
+        let mut incoming = build_tls_incoming(listener, make_test_acceptor(), 1, timeout);
+
+        // Occupy the single slot with a stalling connection.
+        let _stall = TcpStream::connect(addr).await.expect("stall connect");
+
+        // Pre-connect the legitimate client at the TCP level. The OS backlog holds
+        // the connection while the slot is occupied, so accept() returns instantly
+        // once the stall times out — no TCP latency eats into the second timer.
+        let client_tcp = TcpStream::connect(addr).await.expect("client TCP connect");
+
+        // First item: the stalling connection times out.
+        let first = incoming.next().await.expect("first item");
+        assert!(first.is_err(), "stalled connection should time out");
+        let first_err = first.err().expect("checked: is_err()");
+        assert_eq!(first_err.kind(), io::ErrorKind::TimedOut, "should be timeout");
+
+        // Drive server accept and client TLS upgrade in the same cooperative task
+        // via join!. When the server yields at accept(), the client future runs
+        // immediately and sends ClientHello — no scheduler round-trip delay.
+        let (second, _client) = tokio::join!(incoming.next(), finish_tls_client(client_tcp));
+        let second = second.expect("second item");
+        assert!(second.is_ok(), "legitimate client should succeed after slot frees");
+    }
+
+    #[test]
+    fn validate_rejects_zero_handshake_concurrency() {
+        let cfg = TlsConfig {
+            handshake_concurrency: 0,
+            ..TlsConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(result.is_err(), "zero concurrency should error");
+        let err = result.expect_err("checked: is_err()");
+        assert!(
+            err.to_string().contains("concurrency"),
+            "error should mention concurrency"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_handshake_timeout() {
+        let cfg = TlsConfig {
+            handshake_timeout_secs: 0,
+            ..TlsConfig::default()
+        };
+        let result = cfg.validate();
+        assert!(result.is_err(), "zero timeout should error");
+        let err = result.expect_err("checked: is_err()");
+        assert!(err.to_string().contains("timeout"), "error should mention timeout");
+    }
+
+    #[test]
+    fn none_mode_rejects_cert_path() {
+        let cfg = TlsConfig {
+            cert_path: Some("/some/cert.pem".to_owned()),
+            ..TlsConfig::default()
+        };
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "none mode with cert_path should error");
+        let err = result.err().expect("checked: is_err()");
+        assert!(err.to_string().contains("cert_path"), "error should mention cert_path");
+    }
+
+    #[test]
+    fn self_signed_mode_rejects_ca_cert_path() {
+        let cfg = TlsConfig {
+            mode: TlsMode::SelfSigned,
+            ca_cert_path: Some("/some/ca.pem".to_owned()),
+            ..TlsConfig::default()
+        };
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "self_signed mode with ca_cert_path should error");
+        let err = result.err().expect("checked: is_err()");
+        assert!(
+            err.to_string().contains("ca_cert_path"),
+            "error should mention ca_cert_path"
+        );
+    }
 
     #[test]
     fn none_mode_returns_none() {
@@ -156,8 +581,7 @@ mod tests {
     fn self_signed_mode_returns_some() {
         let cfg = TlsConfig {
             mode: TlsMode::SelfSigned,
-            cert_path: None,
-            key_path: None,
+            ..TlsConfig::default()
         };
         let result = build_tls_config(&cfg).expect("should succeed");
         assert!(result.is_some(), "SelfSigned mode should return Some");
@@ -167,10 +591,12 @@ mod tests {
     fn provided_mode_missing_cert_path_errors() {
         let cfg = TlsConfig {
             mode: TlsMode::Provided,
-            cert_path: None,
             key_path: Some("/tmp/key.pem".to_owned()),
+            ..TlsConfig::default()
         };
-        let err = build_tls_config(&cfg).unwrap_err();
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "missing cert_path should error");
+        let err = result.err().expect("checked: is_err() was true");
         assert!(err.to_string().contains("cert_path"), "error should mention cert_path");
     }
 
@@ -179,9 +605,11 @@ mod tests {
         let cfg = TlsConfig {
             mode: TlsMode::Provided,
             cert_path: Some("/tmp/cert.pem".to_owned()),
-            key_path: None,
+            ..TlsConfig::default()
         };
-        let err = build_tls_config(&cfg).unwrap_err();
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "missing key_path should error");
+        let err = result.err().expect("checked: is_err() was true");
         assert!(err.to_string().contains("key_path"), "error should mention key_path");
     }
 
@@ -191,6 +619,7 @@ mod tests {
             mode: TlsMode::Provided,
             cert_path: Some("/nonexistent/cert.pem".to_owned()),
             key_path: Some("/nonexistent/key.pem".to_owned()),
+            ..TlsConfig::default()
         };
         assert!(build_tls_config(&cfg).is_err(), "nonexistent files should error");
     }
@@ -229,6 +658,111 @@ key_path: /etc/tls/key.pem
             cfg.key_path.as_deref(),
             Some("/etc/tls/key.pem"),
             "key path should match"
+        );
+    }
+
+    #[test]
+    fn tls_config_deserializes_mtls() {
+        let cfg: TlsConfig = serde_yaml::from_str(
+            r#"
+mode: provided
+cert_path: /etc/tls/cert.pem
+key_path: /etc/tls/key.pem
+ca_cert_path: /etc/tls/ca.pem
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.ca_cert_path.as_deref(),
+            Some("/etc/tls/ca.pem"),
+            "CA path should match"
+        );
+    }
+
+    #[test]
+    fn provided_mode_mismatched_cert_and_key_errors() {
+        let cert_owner = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert generation");
+        let key_owner = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("key generation");
+
+        let tmp = std::env::temp_dir();
+        let cert_path = tmp.join("praxis_tls_mismatch_cert.pem");
+        let key_path = tmp.join("praxis_tls_mismatch_key.pem");
+
+        std::fs::write(&cert_path, cert_owner.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_owner.key_pair.serialize_pem()).expect("write key from different pair");
+
+        let cfg = TlsConfig {
+            mode: TlsMode::Provided,
+            cert_path: Some(format!("{}", cert_path.display())),
+            key_path: Some(format!("{}", key_path.display())),
+            ca_cert_path: None,
+            ..TlsConfig::default()
+        };
+
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "mismatched cert/key should error at startup");
+        let err = result.err().expect("checked: is_err()");
+        assert!(err.to_string().contains("mismatch"), "error should mention mismatch");
+    }
+
+    #[test]
+    fn provided_mode_nonexistent_ca_cert_errors() {
+        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert generation");
+
+        let tmp = std::env::temp_dir();
+        let cert_path = tmp.join("praxis_tls_neg_test_cert.pem");
+        let key_path = tmp.join("praxis_tls_neg_test_key.pem");
+
+        std::fs::write(&cert_path, server.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("write key");
+
+        let cfg = TlsConfig {
+            mode: TlsMode::Provided,
+            cert_path: Some(format!("{}", cert_path.display())),
+            key_path: Some(format!("{}", key_path.display())),
+            ca_cert_path: Some("/nonexistent/ca.pem".to_owned()),
+            ..TlsConfig::default()
+        };
+
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "nonexistent CA cert should error");
+        let err = result.err().expect("checked: is_err() was true");
+        assert!(err.to_string().contains("CA"), "error should mention CA");
+    }
+
+    #[test]
+    fn provided_mode_with_ca_cert_enables_mtls() {
+        let ca = rcgen::generate_simple_self_signed(vec!["ca.example.com".to_owned()]).expect("CA cert generation");
+        let server = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("server cert generation");
+
+        let tmp = std::env::temp_dir();
+        let cert_path = tmp.join("praxis_tls_test_cert.pem");
+        let key_path = tmp.join("praxis_tls_test_key.pem");
+        let ca_path = tmp.join("praxis_tls_test_ca.pem");
+
+        std::fs::write(&cert_path, server.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, server.key_pair.serialize_pem()).expect("write key");
+        std::fs::write(&ca_path, ca.cert.pem()).expect("write CA cert");
+
+        let cfg = TlsConfig {
+            mode: TlsMode::Provided,
+            cert_path: Some(format!("{}", cert_path.display())),
+            key_path: Some(format!("{}", key_path.display())),
+            ca_cert_path: Some(format!("{}", ca_path.display())),
+            ..TlsConfig::default()
+        };
+
+        let result = build_tls_config(&cfg);
+        assert!(result.is_ok(), "mTLS config should load without error");
+        let acceptor = result.ok().flatten().expect("should return Some acceptor");
+        let verify_mode = acceptor.context().verify_mode();
+        assert!(
+            verify_mode.contains(SslVerifyMode::PEER),
+            "acceptor should require client certificate"
+        );
+        assert!(
+            verify_mode.contains(SslVerifyMode::FAIL_IF_NO_PEER_CERT),
+            "acceptor should reject missing client certificate"
         );
     }
 }

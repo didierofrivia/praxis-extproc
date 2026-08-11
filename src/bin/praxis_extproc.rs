@@ -91,11 +91,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Start gRPC, health, and metrics servers concurrently.
-#[expect(
-    clippy::large_stack_frames,
-    clippy::cognitive_complexity,
-    reason = "async state machine for server startup"
-)]
+#[expect(clippy::cognitive_complexity, reason = "async state machine for server startup")]
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
@@ -132,19 +128,43 @@ async fn serve_grpc(
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
     tls_cfg: &tls::TlsConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let svc = PraxisExtProc::new(pipeline);
-    let tls = tls::build_tls_config(tls_cfg)?;
-
-    let mut builder = Server::builder();
-    if let Some(tls_config) = tls {
-        builder = builder.tls_config(tls_config)?;
+    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
+    match tls::build_tls_config(tls_cfg)? {
+        None => Box::pin(serve_plaintext(addr, svc)).await,
+        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,
     }
+}
 
-    builder
-        .add_service(ExternalProcessorServer::new(svc))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+/// Serve gRPC over plaintext TCP.
+async fn serve_plaintext(
+    addr: std::net::SocketAddr,
+    svc: ExternalProcessorServer<PraxisExtProc>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(
+        Server::builder()
+            .add_service(svc)
+            .serve_with_shutdown(addr, shutdown_signal()),
+    )
+    .await?;
+    Ok(())
+}
 
+/// Serve gRPC over TLS using the provided acceptor.
+async fn serve_tls(
+    addr: std::net::SocketAddr,
+    svc: ExternalProcessorServer<PraxisExtProc>,
+    acceptor: openssl::ssl::SslAcceptor,
+    tls_cfg: &tls::TlsConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs);
+    let incoming = tls::build_tls_incoming(listener, acceptor, tls_cfg.handshake_concurrency, timeout);
+    Box::pin(
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming_shutdown(incoming, shutdown_signal()),
+    )
+    .await?;
     Ok(())
 }
 

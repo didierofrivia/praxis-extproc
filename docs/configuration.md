@@ -165,8 +165,11 @@ server:
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `mode` | string | `none` | `none`, `self_signed`, or `provided` |
-| `cert_path` | string | none | PEM certificate path (required for `provided`) |
-| `key_path` | string | none | PEM private key path (required for `provided`) |
+| `cert_path` | string | — | PEM certificate path (required for `provided`) |
+| `key_path` | string | — | PEM private key path (required for `provided`) |
+| `ca_cert_path` | string | — | PEM CA cert for mTLS client verification (`provided` only) |
+| `handshake_concurrency` | integer | `64` | Maximum simultaneous in-flight TLS handshakes |
+| `handshake_timeout_secs` | integer | `10` | Per-handshake deadline in seconds; stalled connections are dropped |
 
 TLS modes:
 
@@ -179,12 +182,27 @@ TLS modes:
   disk. Use for production deployments where the
   Envoy-to-ExtProc link must be encrypted.
 
+When `ca_cert_path` is set, the server requires
+clients to present a valid certificate signed by
+that CA (mTLS). Only available in `provided` mode.
+
+`handshake_concurrency` bounds how many TLS
+handshakes run in parallel; when all slots are
+occupied, new TCP accepts stall until a slot frees.
+`handshake_timeout_secs` cancels any single
+handshake that exceeds the deadline, freeing its
+slot for the next connection. Both values must be
+greater than zero.
+
 ```yaml
 server:
   tls:
     mode: provided
     cert_path: /etc/tls/cert.pem
     key_path: /etc/tls/key.pem
+    ca_cert_path: /etc/tls/ca.pem   # optional: enables mTLS
+    handshake_concurrency: 64        # optional: default shown
+    handshake_timeout_secs: 10       # optional: default shown
 ```
 
 ## Insecure Options
@@ -272,7 +290,12 @@ problems:
 - **Unknown filter name**: pipeline construction
   fails with the unrecognized filter name.
 - **TLS certificate load failure**: the process exits
-  if `cert_path` or `key_path` cannot be read.
+  if `cert_path`, `key_path`, or `ca_cert_path`
+  cannot be read, or if the certificate and key do
+  not match each other.
+- **Invalid TLS values**: `handshake_concurrency`
+  or `handshake_timeout_secs` set to zero cause an
+  immediate startup error.
 - **Address bind failure**: the server fails to start
   if any listen address is already in use.
 
