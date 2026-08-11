@@ -11,8 +11,7 @@
 //! mTLS client certificate verification is supported via `ca_cert_path`.
 
 use std::{
-    fmt,
-    io,
+    fmt, io,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -355,6 +354,9 @@ fn build_provided(cfg: &TlsConfig) -> crate::error::Result<SslAcceptor> {
     builder
         .set_private_key_file(key_path, SslFiletype::PEM)
         .map_err(|e| crate::error::ExtProcError::Config(format!("private key: {e}")))?;
+    builder
+        .check_private_key()
+        .map_err(|e| crate::error::ExtProcError::Config(format!("cert/key mismatch: {e}")))?;
     set_alpn_h2(&mut builder)?;
     if let Some(ca_path) = &cfg.ca_cert_path {
         info!(ca = ca_path, "enabling mTLS client verification");
@@ -632,6 +634,32 @@ ca_cert_path: /etc/tls/ca.pem
             Some("/etc/tls/ca.pem"),
             "CA path should match"
         );
+    }
+
+    #[test]
+    fn provided_mode_mismatched_cert_and_key_errors() {
+        let cert_owner = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("cert generation");
+        let key_owner = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("key generation");
+
+        let tmp = std::env::temp_dir();
+        let cert_path = tmp.join("praxis_tls_mismatch_cert.pem");
+        let key_path = tmp.join("praxis_tls_mismatch_key.pem");
+
+        std::fs::write(&cert_path, cert_owner.cert.pem()).expect("write cert");
+        std::fs::write(&key_path, key_owner.key_pair.serialize_pem()).expect("write key from different pair");
+
+        let cfg = TlsConfig {
+            mode: TlsMode::Provided,
+            cert_path: Some(format!("{}", cert_path.display())),
+            key_path: Some(format!("{}", key_path.display())),
+            ca_cert_path: None,
+            ..TlsConfig::default()
+        };
+
+        let result = build_tls_config(&cfg);
+        assert!(result.is_err(), "mismatched cert/key should error at startup");
+        let err = result.err().expect("checked: is_err()");
+        assert!(err.to_string().contains("mismatch"), "error should mention mismatch");
     }
 
     #[test]
