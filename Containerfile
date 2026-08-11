@@ -55,6 +55,9 @@ RUN set -eu; \
 
 FROM registry.access.redhat.com/ubi10/ubi-minimal
 
+RUN microdnf install -y openssl-libs \
+    && microdnf clean all
+
 COPY --from=builder /praxis-extproc /usr/local/bin/praxis-extproc
 
 USER 1001
