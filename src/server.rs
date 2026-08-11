@@ -535,7 +535,15 @@ async fn run_response_pipeline(
         return Ok(vec![response::immediate(rejection)]);
     }
 
-    let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+    let current_mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
+
+    let mutation = match phase {
+        ResponsePhase::Headers => current_mutation,
+        ResponsePhase::Body => {
+            let deferred = state.deferred_response_header_mutation.take();
+            merge_mutations(deferred, current_mutation)
+        },
+    };
 
     Ok(build_response_for_phase(
         phase,
@@ -587,11 +595,11 @@ fn build_response_for_phase(
     }
 }
 
-/// Run response filters at header time and return header mutations.
+/// Run response filters at header time and defer mutations until body phase.
 ///
-/// This executes the response pipeline early so mutations can be
-/// included in the `ResponseHeaders` reply. Body processing runs
-/// separately when the body arrives.
+/// This executes the response pipeline early but defers header mutations
+/// to the body phase where they will be merged with any body-phase mutations.
+/// Body processing runs separately when the body arrives.
 async fn run_response_header_filters_early(
     pipeline: &FilterPipeline,
     state: &mut StreamState,
@@ -612,13 +620,15 @@ async fn run_response_header_filters_early(
 
     let action = execute_response(pipeline, &mut ctx).await?;
     if let Some(imm) = check_reject(action) {
-        return Err(Status::aborted(imm.body));
+        return Ok(vec![response::immediate(imm)]);
     }
 
     state.response_filters_executed = true;
     let mutation = adapter::collect_response_header_mutations_diff(&ctx, &original_headers);
 
-    Ok(vec![response::response_headers(mutation)])
+    state.deferred_response_header_mutation = mutation;
+
+    Ok(vec![response::response_headers(None)])
 }
 
 /// Capture response header names and values before filter execution.
@@ -748,6 +758,9 @@ struct StreamState {
 
     /// Protocol configuration parsed from Envoy's first message.
     protocol_config: ProtocolConfig,
+
+    /// Deferred response header mutation when body is expected.
+    deferred_response_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 }
 
 impl StreamState {
@@ -802,6 +815,24 @@ fn request_type_label(req: &processing_request::Request) -> &'static str {
         processing_request::Request::ResponseBody(_) => "response_body",
         processing_request::Request::RequestTrailers(_) => "request_trailers",
         processing_request::Request::ResponseTrailers(_) => "response_trailers",
+    }
+}
+
+/// Merge deferred header mutations with current mutations.
+///
+/// When both are present, combines their `set_headers` and `remove_headers` vectors.
+fn merge_mutations(
+    deferred: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+    current: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+) -> Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation> {
+    match (deferred, current) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(mut d), Some(c)) => {
+            d.set_headers.extend(c.set_headers);
+            d.remove_headers.extend(c.remove_headers);
+            Some(d)
+        },
     }
 }
 

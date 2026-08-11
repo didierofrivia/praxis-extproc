@@ -1259,6 +1259,80 @@ async fn full_duplex_response_body() {
     );
 }
 
+#[tokio::test]
+async fn response_headers_deferred_by_default() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let stream = ReceiverStream::new(rx);
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+    let _req_headers_resp = response_stream.message().await.unwrap();
+
+    tx.send(make_response_headers(200, false)).await.unwrap();
+
+    let resp_headers_resp = response_stream.message().await.unwrap().unwrap();
+
+    if let Some(RespVariant::ResponseHeaders(h)) = &resp_headers_resp.response {
+        let has_x_resp = h
+            .response
+            .as_ref()
+            .and_then(|c| c.header_mutation.as_ref())
+            .is_some_and(|m| {
+                m.set_headers
+                    .iter()
+                    .filter_map(|h| h.header.as_ref())
+                    .any(|hv| hv.key == "x-resp")
+            });
+        assert!(!has_x_resp, "X-Resp should be deferred until body phase");
+    } else {
+        panic!("expected ResponseHeaders, got: {resp_headers_resp:?}");
+    }
+
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"test body".to_vec(),
+            end_of_stream: true,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let resp_body_resp = response_stream.message().await.unwrap().unwrap();
+
+    if let Some(RespVariant::ResponseBody(b)) = &resp_body_resp.response {
+        let has_x_resp = b
+            .response
+            .as_ref()
+            .and_then(|c| c.header_mutation.as_ref())
+            .is_some_and(|m| {
+                m.set_headers
+                    .iter()
+                    .filter_map(|h| h.header.as_ref())
+                    .any(|hv| hv.key == "x-resp" && hv.value == "true")
+            });
+
+        if !has_x_resp {
+            let all_headers: Vec<_> = b
+                .response
+                .as_ref()
+                .and_then(|c| c.header_mutation.as_ref())
+                .map(|m| {
+                    m.set_headers
+                        .iter()
+                        .filter_map(|h| h.header.as_ref())
+                        .map(|hv| format!("{}={}", hv.key, hv.value))
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!("X-Resp should appear in body response. Found headers: {all_headers:?}");
+        }
+    } else {
+        panic!("expected ResponseBody, got: {resp_body_resp:?}");
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
