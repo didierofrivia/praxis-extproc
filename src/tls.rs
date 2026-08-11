@@ -424,10 +424,14 @@ mod tests {
     }
 
     async fn connect_test_client(addr: SocketAddr) -> tokio_openssl::SslStream<TcpStream> {
+        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
+        finish_tls_client(tcp).await
+    }
+
+    async fn finish_tls_client(tcp: TcpStream) -> tokio_openssl::SslStream<TcpStream> {
         let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector builder");
         builder.set_verify(SslVerifyMode::NONE);
         let connector = builder.build();
-        let tcp = TcpStream::connect(addr).await.expect("TCP connect");
         let ssl = connector
             .configure()
             .expect("configure")
@@ -492,9 +496,10 @@ mod tests {
         // Occupy the single slot with a stalling connection.
         let _stall = TcpStream::connect(addr).await.expect("stall connect");
 
-        // Legitimate client connects; TCP handshake completes in the OS backlog
-        // but our accept loop cannot proceed until the slot is freed.
-        let client = tokio::spawn(async move { connect_test_client(addr).await });
+        // Pre-connect the legitimate client at the TCP level. The OS backlog holds
+        // the connection while the slot is occupied, so accept() returns instantly
+        // once the stall times out — no TCP latency eats into the second timer.
+        let client_tcp = TcpStream::connect(addr).await.expect("client TCP connect");
 
         // First item: the stalling connection times out.
         let first = incoming.next().await.expect("first item");
@@ -502,11 +507,12 @@ mod tests {
         let first_err = first.err().expect("checked: is_err()");
         assert_eq!(first_err.kind(), io::ErrorKind::TimedOut, "should be timeout");
 
-        // Second item: slot freed, legitimate client accepted and handshake succeeds.
-        let second = incoming.next().await.expect("second item");
+        // Drive server accept and client TLS upgrade in the same cooperative task
+        // via join!. When the server yields at accept(), the client future runs
+        // immediately and sends ClientHello — no scheduler round-trip delay.
+        let (second, _client) = tokio::join!(incoming.next(), finish_tls_client(client_tcp));
+        let second = second.expect("second item");
         assert!(second.is_ok(), "legitimate client should succeed after slot frees");
-
-        drop(client.await.expect("client task"));
     }
 
     #[test]
