@@ -369,6 +369,10 @@ async fn handle_request_headers(
         return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
     }
 
+    if state.protocol_config.request_body_mode == BodyMode::Streamed {
+        return run_request_header_filters_early(pipeline, state).await;
+    }
+
     Ok(vec![response::request_headers(None)])
 }
 
@@ -381,6 +385,13 @@ async fn handle_request_body(
     state
         .eos_tracker
         .check_and_mark(ProtocolPhase::RequestBody, body.end_of_stream)?;
+
+    // STREAMED chunks are processed individually without accumulation,
+    // so check_body_limit (an OOM guard) does not apply; gRPC frame
+    // size provides the per-chunk bound.
+    if state.protocol_config.request_body_mode == BodyMode::Streamed {
+        return process_streamed_body_chunk(pipeline, body, state, true).await;
+    }
 
     check_body_limit(state.request_body.len(), body.body.len())?;
     state.request_body.extend_from_slice(&body.body);
@@ -426,6 +437,10 @@ async fn handle_response_body(
         .eos_tracker
         .check_and_mark(ProtocolPhase::ResponseBody, body.end_of_stream)?;
 
+    if state.protocol_config.response_body_mode == BodyMode::Streamed {
+        return process_streamed_body_chunk(pipeline, body, state, false).await;
+    }
+
     check_body_limit(state.response_body.len(), body.body.len())?;
     state.response_body.extend_from_slice(&body.body);
 
@@ -467,7 +482,7 @@ async fn run_request_pipeline(
         return Ok(vec![response::immediate(imm)]);
     }
 
-    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body).await?;
+    let body_reject = run_body_filters(pipeline, &mut ctx, &mut state.request_body, true).await?;
     if let Some(imm) = body_reject {
         return Ok(vec![response::immediate(imm)]);
     }
@@ -575,7 +590,7 @@ async fn execute_response_pipeline_and_body_filters(
         }
     }
 
-    let body_reject = run_resp_body_filters(pipeline, ctx, response_body)?;
+    let body_reject = run_resp_body_filters(pipeline, ctx, response_body, true)?;
     Ok(body_reject)
 }
 
@@ -593,6 +608,91 @@ fn build_response_for_phase(
             response::response_body(body_data, mutation, body_mode)
         },
     }
+}
+
+// -----------------------------------------------------------------------------
+// Streamed Body Chunk Handlers
+// -----------------------------------------------------------------------------
+
+/// Process a single body chunk in `STREAMED` mode.
+///
+/// Runs body filters on the chunk and responds immediately.
+/// Deferred header mutations are included on the first chunk's response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Reusable for request and response processing, better than 2 different functions"
+)]
+async fn process_streamed_body_chunk(
+    pipeline: &FilterPipeline,
+    body: praxis_proto::envoy::service::ext_proc::v3::HttpBody,
+    state: &mut StreamState,
+    is_request: bool,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let request = state
+        .request
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    let mut ctx = adapter::build_filter_context(pipeline, request);
+    state.restore_request_ctx(&mut ctx);
+    if !is_request {
+        let resp = state
+            .response
+            .as_mut()
+            .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+        ctx.response_header = Some(resp);
+    }
+    let eos = body.end_of_stream;
+    let mut chunk = body.body;
+    let reject = if is_request {
+        run_body_filters(pipeline, &mut ctx, &mut chunk, eos).await?
+    } else {
+        run_resp_body_filters(pipeline, &mut ctx, &mut chunk, eos)?
+    };
+    if let Some(imm) = reject {
+        return Ok(vec![response::immediate(imm)]);
+    }
+    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
+    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    let mutation = if is_request {
+        state.deferred_request_header_mutation.take()
+    } else {
+        state.deferred_response_header_mutation.take()
+    };
+    let body_data = body_data_if_present(&chunk);
+    let build = if is_request {
+        response::request_body
+    } else {
+        response::response_body
+    };
+    Ok(build(body_data, mutation, BodyMode::Streamed))
+}
+
+/// Run request filters at header time and defer mutations until body phase.
+///
+/// Used in `STREAMED` body mode where each body chunk must receive an
+/// immediate response. The pipeline runs once here; body filters run
+/// per-chunk in [`process_streamed_body_chunk`].
+async fn run_request_header_filters_early(
+    pipeline: &FilterPipeline,
+    state: &mut StreamState,
+) -> Result<Vec<ProcessingResponse>, Status> {
+    let Some(request) = state.request.as_ref() else {
+        return Ok(vec![response::request_headers(None)]);
+    };
+    let mut ctx = adapter::build_filter_context(pipeline, request);
+
+    let action = execute_request(pipeline, &mut ctx).await?;
+    if let Some(imm) = check_reject(action) {
+        return Ok(vec![response::immediate(imm)]);
+    }
+
+    state.executed_filter_indices = mem::take(&mut ctx.executed_filter_indices);
+    state.branch_iterations = mem::take(&mut ctx.branch_iterations);
+    state.filter_metadata = mem::take(&mut ctx.filter_metadata);
+    state.deferred_request_header_mutation = adapter::collect_request_header_mutations(&ctx);
+
+    Ok(vec![response::request_headers(None)])
 }
 
 /// Run response filters at header time and defer mutations until body phase.
@@ -674,6 +774,7 @@ async fn run_body_filters(
     pipeline: &FilterPipeline,
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
+    eos: bool,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     if body_buf.is_empty() {
         return Ok(None);
@@ -681,7 +782,7 @@ async fn run_body_filters(
 
     let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
-        .execute_http_request_body(ctx, &mut body, true)
+        .execute_http_request_body(ctx, &mut body, eos)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -701,6 +802,7 @@ fn run_resp_body_filters(
     pipeline: &FilterPipeline,
     ctx: &mut HttpFilterContext<'_>,
     body_buf: &mut Vec<u8>,
+    eos: bool,
 ) -> Result<Option<praxis_proto::envoy::service::ext_proc::v3::ImmediateResponse>, Status> {
     if body_buf.is_empty() {
         return Ok(None);
@@ -708,7 +810,7 @@ fn run_resp_body_filters(
 
     let mut body = Some(Bytes::from(mem::take(body_buf)));
     let action = pipeline
-        .execute_http_response_body(ctx, &mut body, true)
+        .execute_http_response_body(ctx, &mut body, eos)
         .map_err(|e| Status::internal(e.to_string()))?;
 
     if let Some(b) = body {
@@ -758,6 +860,9 @@ struct StreamState {
 
     /// Protocol configuration parsed from Envoy's first message.
     protocol_config: ProtocolConfig,
+
+    /// Deferred request header mutation for STREAMED body mode.
+    deferred_request_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
 
     /// Deferred response header mutation when body is expected.
     deferred_response_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,

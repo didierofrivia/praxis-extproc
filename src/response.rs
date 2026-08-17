@@ -137,7 +137,6 @@ pub(crate) fn response_body(
 ) -> Vec<ProcessingResponse> {
     body_responses(body, mutation, false, body_mode)
 }
-
 // -----------------------------------------------------------------------------
 // Trailer Responses
 // -----------------------------------------------------------------------------
