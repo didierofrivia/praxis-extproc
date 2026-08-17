@@ -895,7 +895,7 @@ async fn repro_ap_post_eos_headers() {
 }
 
 #[tokio::test]
-async fn wrong_wire_mode_unsupported_streamed_rejected() {
+async fn wrong_wire_mode_unsupported_buffered_partial_rejected() {
     use praxis_proto::envoy::service::ext_proc::v3::ProtocolConfiguration;
 
     let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
@@ -905,8 +905,8 @@ async fn wrong_wire_mode_unsupported_streamed_rejected() {
 
     let mut headers = make_request_headers("POST", "/submit", false);
     headers.protocol_config = Some(ProtocolConfiguration {
-        request_body_mode: 1, // STREAMED — not implemented
-        response_body_mode: 1,
+        request_body_mode: 3, // BUFFERED_PARTIAL — not implemented
+        response_body_mode: 3,
         send_body_without_waiting_for_header_response: false,
     });
     tx.send(headers).await.unwrap();
@@ -921,24 +921,21 @@ async fn wrong_wire_mode_unsupported_streamed_rejected() {
             assert_eq!(
                 err.code(),
                 tonic::Code::InvalidArgument,
-                "ap-wrong-wire-mode: expected InvalidArgument for STREAMED mode, got {}: {}",
+                "expected InvalidArgument for BUFFERED_PARTIAL mode, got {}: {}",
                 err.code(),
                 err.message()
             );
             assert!(
-                err.message().contains("STREAMED") || err.message().contains("not yet implemented"),
-                "error message should mention STREAMED or not implemented, got: {}",
+                err.message().contains("BUFFERED_PARTIAL") || err.message().contains("not yet implemented"),
+                "error message should mention BUFFERED_PARTIAL or not implemented, got: {}",
                 err.message()
             );
         },
         Ok(Ok(Some(msg))) => {
-            panic!(
-                "ap-wrong-wire-mode REPRODUCED BUG: expected InvalidArgument for unsupported mode, \
-                 got success response: {msg:?}"
-            );
+            panic!("expected InvalidArgument for unsupported mode, got success response: {msg:?}");
         },
-        Ok(Ok(None)) => panic!("ap-wrong-wire-mode: stream closed without error"),
-        Err(_) => panic!("ap-wrong-wire-mode: timed out waiting for rejection"),
+        Ok(Ok(None)) => panic!("stream closed without error"),
+        Err(_) => panic!("timed out waiting for rejection"),
     }
 }
 
@@ -954,7 +951,7 @@ async fn unsupported_response_body_mode_rejected() {
     let mut headers = make_request_headers("POST", "/submit", false);
     headers.protocol_config = Some(ProtocolConfiguration {
         request_body_mode: 2,
-        response_body_mode: 1,
+        response_body_mode: 3, // BUFFERED_PARTIAL — not implemented
         send_body_without_waiting_for_header_response: false,
     });
     tx.send(headers).await.unwrap();

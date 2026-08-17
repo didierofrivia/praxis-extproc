@@ -28,7 +28,6 @@ pub(crate) enum BodyMode {
     #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     None = 0,
     /// Body sent in streaming mode (incremental processing).
-    #[expect(dead_code, reason = "documents protocol; not yet implemented")]
     Streamed = 1,
     /// Body buffered until complete, then sent as single chunk.
     #[default]
@@ -45,8 +44,8 @@ impl TryFrom<i32> for BodyMode {
 
     /// Parse from Envoy's `protocol_config` field.
     ///
-    /// Only `BUFFERED` (2) and `FULL_DUPLEX_STREAMED` (4) are supported at this stage.
-    /// `NONE` (0) maps to `BUFFERED` (2)
+    /// Supported: `STREAMED` (1), `BUFFERED` (2), `FULL_DUPLEX_STREAMED` (4).
+    /// `NONE` (0) maps to `BUFFERED` (2).
     ///
     /// # Errors
     ///
@@ -54,9 +53,8 @@ impl TryFrom<i32> for BodyMode {
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
             0 | 2 => Ok(Self::Buffered),
+            1 => Ok(Self::Streamed),
             4 => Ok(Self::FullDuplexStreamed),
-            // Other modes documented but not yet implemented
-            1 => Err("BodySendMode::STREAMED (1) is not yet implemented".to_owned()),
             3 => Err("BodySendMode::BUFFERED_PARTIAL (3) is not yet implemented".to_owned()),
             _ => Err(format!("unknown BodySendMode value {value}")),
         }
@@ -690,13 +688,13 @@ mod tests {
     #[test]
     fn body_mode_from_i32_valid_modes() {
         assert_eq!(BodyMode::try_from(0).unwrap(), BodyMode::Buffered);
+        assert_eq!(BodyMode::try_from(1).unwrap(), BodyMode::Streamed);
         assert_eq!(BodyMode::try_from(2).unwrap(), BodyMode::Buffered);
         assert_eq!(BodyMode::try_from(4).unwrap(), BodyMode::FullDuplexStreamed);
     }
 
     #[test]
     fn body_mode_from_i32_invalid_modes() {
-        assert!(BodyMode::try_from(1).is_err());
         assert!(BodyMode::try_from(3).is_err());
         assert!(BodyMode::try_from(999).is_err());
     }
