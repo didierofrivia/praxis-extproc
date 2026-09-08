@@ -218,6 +218,101 @@ fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: Protocol
     Ok(())
 }
 
+/// Which direction of the exchange a message belongs to.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum PhaseSide {
+    /// Request-side phases (headers, body, trailers).
+    Request,
+    /// Response-side phases (headers, body, trailers).
+    Response,
+}
+
+/// Ordered position within one direction's phase sequence.
+///
+/// The derived ordering is `Headers` < `Body` < `Trailers`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PhaseStep {
+    /// Headers phase.
+    Headers,
+    /// Body phase.
+    Body,
+    /// Trailers phase.
+    Trailers,
+}
+
+/// Direction and step of a message within its direction's sequence.
+///
+/// Each direction advances monotonically (headers → body → trailers), but the
+/// two directions are independent: in `FULL_DUPLEX_STREAMED` Envoy interleaves
+/// request-body chunks with response processing, so ordering is enforced per
+/// direction rather than globally.
+const fn message_order(req: &processing_request::Request) -> (PhaseSide, PhaseStep) {
+    match req {
+        processing_request::Request::RequestHeaders(_) => (PhaseSide::Request, PhaseStep::Headers),
+        processing_request::Request::RequestBody(_) => (PhaseSide::Request, PhaseStep::Body),
+        processing_request::Request::RequestTrailers(_) => (PhaseSide::Request, PhaseStep::Trailers),
+        processing_request::Request::ResponseHeaders(_) => (PhaseSide::Response, PhaseStep::Headers),
+        processing_request::Request::ResponseBody(_) => (PhaseSide::Response, PhaseStep::Body),
+        processing_request::Request::ResponseTrailers(_) => (PhaseSide::Response, PhaseStep::Trailers),
+    }
+}
+
+/// Tracks per-direction phase progression to reject out-of-order messages.
+///
+/// Each direction advances monotonically (`Headers` → `Body` → `Trailers`); the
+/// two are independent so `FULL_DUPLEX_STREAMED` interleaving is allowed.
+/// Response messages are gated on request headers having been seen.
+#[derive(Debug, Default)]
+struct PhaseOrderTracker {
+    /// Furthest request-side step seen.
+    request: Option<PhaseStep>,
+    /// Furthest response-side step seen.
+    response: Option<PhaseStep>,
+    /// Whether request headers have been received, gating response processing.
+    request_headers_seen: bool,
+}
+
+impl PhaseOrderTracker {
+    /// Validate a message's position and advance the tracker.
+    ///
+    /// Equal steps are allowed (repeated body chunks); duplicate-EOS is caught
+    /// per-phase by [`EosTracker`]. Called before any handler mutates state, so a
+    /// rejection leaves no partial per-stream state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Status::invalid_argument`] when `req` regresses within its
+    /// direction, or when a response message precedes request headers.
+    fn check_and_advance(&mut self, req: &processing_request::Request) -> Result<(), Status> {
+        let (side, step) = message_order(req);
+        let current = match side {
+            PhaseSide::Request => &mut self.request,
+            PhaseSide::Response => {
+                if !self.request_headers_seen {
+                    return Err(Status::invalid_argument(format!(
+                        "out-of-order ExtProc message: {} arrived before request headers",
+                        request_type_label(req)
+                    )));
+                }
+                &mut self.response
+            },
+        };
+
+        if current.is_some_and(|prev| step < prev) {
+            return Err(Status::invalid_argument(format!(
+                "out-of-order ExtProc message: {} arrived after a later {side:?} phase",
+                request_type_label(req)
+            )));
+        }
+        *current = Some(step);
+
+        if matches!(req, processing_request::Request::RequestHeaders(_)) {
+            self.request_headers_seen = true;
+        }
+        Ok(())
+    }
+}
+
 /// Dispatch a single ExtProc request variant to the appropriate handler.
 #[expect(
     clippy::large_stack_frames,
@@ -228,6 +323,8 @@ async fn dispatch_request(
     req: processing_request::Request,
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
+    state.phase_order.check_and_advance(&req)?;
+
     match req {
         processing_request::Request::RequestHeaders(h) => handle_request_headers(pipeline, h, state).await,
         processing_request::Request::RequestBody(b) => handle_request_body(pipeline, b, state).await,
@@ -1131,6 +1228,9 @@ struct StreamState {
 
     /// Deferred response header mutation for BUFFERED or FDS passthrough mode.
     deferred_response_header_mutation: Option<praxis_proto::envoy::service::ext_proc::v3::HeaderMutation>,
+
+    /// Per-direction phase ordering guard.
+    phase_order: PhaseOrderTracker,
 }
 
 impl StreamState {
@@ -1308,6 +1408,145 @@ mod tests {
                 "re-delivery should report Completed for {phase:?}"
             );
         }
+    }
+
+    /// Assert every message classifies to `side` with strictly increasing steps.
+    fn assert_monotonic(side: PhaseSide, msgs: &[processing_request::Request]) {
+        let orders = msgs.iter().map(message_order).collect::<Vec<_>>();
+        assert!(
+            orders.iter().all(|(s, _)| *s == side),
+            "messages must classify as {side:?}, got {orders:?}"
+        );
+        assert!(
+            orders
+                .windows(2)
+                .all(|w| w.first().map(|t| t.1) < w.last().map(|t| t.1)),
+            "steps must be strictly increasing, got {orders:?}"
+        );
+    }
+
+    #[test]
+    fn message_order_is_monotonic_within_each_direction() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders, HttpTrailers};
+        use processing_request::Request;
+
+        assert_monotonic(
+            PhaseSide::Request,
+            &[
+                Request::RequestHeaders(HttpHeaders::default()),
+                Request::RequestBody(HttpBody::default()),
+                Request::RequestTrailers(HttpTrailers::default()),
+            ],
+        );
+        assert_monotonic(
+            PhaseSide::Response,
+            &[
+                Request::ResponseHeaders(HttpHeaders::default()),
+                Request::ResponseBody(HttpBody::default()),
+                Request::ResponseTrailers(HttpTrailers::default()),
+            ],
+        );
+    }
+
+    #[test]
+    fn phase_order_allows_forward_and_repeated_phases() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders};
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        for req in [
+            Request::RequestHeaders(HttpHeaders::default()),
+            Request::RequestBody(HttpBody::default()),
+            Request::RequestBody(HttpBody::default()),
+            Request::ResponseHeaders(HttpHeaders::default()),
+            Request::ResponseBody(HttpBody::default()),
+        ] {
+            assert!(
+                tracker.check_and_advance(&req).is_ok(),
+                "forward/repeated sequence must be accepted, rejected at {req:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_order_allows_full_duplex_interleaving() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders};
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        // FULL_DUPLEX_STREAMED: request-body chunks may interleave with response
+        // processing. RequestHeaders -> RequestBody -> ResponseHeaders -> RequestBody
+        // is a legal sequence and must not be rejected.
+        for req in [
+            Request::RequestHeaders(HttpHeaders::default()),
+            Request::RequestBody(HttpBody::default()),
+            Request::ResponseHeaders(HttpHeaders::default()),
+            Request::RequestBody(HttpBody::default()),
+        ] {
+            assert!(
+                tracker.check_and_advance(&req).is_ok(),
+                "interleaved sequence must be accepted, rejected at {req:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_order_rejects_within_direction_regression() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders};
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        for req in [
+            Request::RequestHeaders(HttpHeaders::default()),
+            Request::ResponseHeaders(HttpHeaders::default()),
+            Request::ResponseBody(HttpBody::default()),
+        ] {
+            assert!(tracker.check_and_advance(&req).is_ok());
+        }
+
+        // ResponseHeaders after ResponseBody regresses within the response direction.
+        let result = tracker.check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()));
+        assert!(result.is_err(), "ResponseHeaders after ResponseBody should be rejected");
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("out-of-order"));
+        }
+    }
+
+    #[test]
+    fn phase_order_rejects_response_before_request_headers() {
+        use praxis_proto::envoy::service::ext_proc::v3::HttpHeaders;
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        let result = tracker.check_and_advance(&Request::ResponseHeaders(HttpHeaders::default()));
+        assert!(result.is_err(), "response before request headers should be rejected");
+        if let Err(err) = result {
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("before request headers"));
+        }
+    }
+
+    #[test]
+    fn phase_order_rejects_request_direction_regression() {
+        use praxis_proto::envoy::service::ext_proc::v3::{HttpBody, HttpHeaders, HttpTrailers};
+        use processing_request::Request;
+        let mut tracker = PhaseOrderTracker::default();
+
+        assert!(
+            tracker
+                .check_and_advance(&Request::RequestHeaders(HttpHeaders::default()))
+                .is_ok()
+        );
+        assert!(
+            tracker
+                .check_and_advance(&Request::RequestTrailers(HttpTrailers::default()))
+                .is_ok()
+        );
+
+        let result = tracker.check_and_advance(&Request::RequestBody(HttpBody::default()));
+        assert!(result.is_err(), "RequestBody after RequestTrailers should be rejected");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
