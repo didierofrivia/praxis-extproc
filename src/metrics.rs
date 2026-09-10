@@ -31,6 +31,10 @@ pub fn register() {
         "praxis_extproc_request_duration_seconds",
         "Per-stream processing duration"
     );
+    metrics::describe_counter!(
+        "praxis_extproc_body_size_rejections_total",
+        "Total requests rejected for exceeding max body accumulation"
+    );
 }
 
 /// Record a completed stream.
@@ -42,6 +46,11 @@ pub fn record_request(duration_secs: f64) {
 /// Record an immediate response (rejection).
 pub fn record_immediate_response() {
     metrics::counter!("praxis_extproc_immediate_responses_total").increment(1);
+}
+
+/// Record a rejection for exceeding max body accumulation.
+pub fn record_body_size_rejection() {
+    metrics::counter!("praxis_extproc_body_size_rejections_total").increment(1);
 }
 
 // -----------------------------------------------------------------------------
