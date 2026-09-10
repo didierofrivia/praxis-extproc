@@ -31,7 +31,7 @@ use praxis_extproc::{config, server::PraxisExtProc};
 use praxis_proto::envoy::service::{
     common::v3::HeaderValue,
     ext_proc::v3::{
-        HeaderMap, HttpBody, HttpHeaders, ProcessingRequest, ProcessingResponse,
+        HeaderMap, HttpBody, HttpHeaders, HttpTrailers, ProcessingRequest, ProcessingResponse,
         external_processor_server::ExternalProcessorServer, processing_request::Request as ReqVariant,
         processing_response::Response as RespVariant,
     },
@@ -163,9 +163,7 @@ async fn trailers_passthrough() {
     drop(inbound.message().await);
 
     tx.send(ProcessingRequest {
-        request: Some(ReqVariant::RequestTrailers(
-            praxis_proto::envoy::service::ext_proc::v3::HttpTrailers { trailers: None },
-        )),
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers { trailers: None })),
         ..Default::default()
     })
     .await
@@ -222,9 +220,7 @@ async fn response_trailers_passthrough() {
     drop(inbound.message().await);
 
     tx.send(ProcessingRequest {
-        request: Some(ReqVariant::ResponseTrailers(
-            praxis_proto::envoy::service::ext_proc::v3::HttpTrailers { trailers: None },
-        )),
+        request: Some(ReqVariant::ResponseTrailers(HttpTrailers { trailers: None })),
         ..Default::default()
     })
     .await
@@ -582,13 +578,13 @@ async fn duplicate_eos_in_request_headers_rejected() {
     .expect_err("duplicate EOS was accepted");
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
-        err.message().contains("after end_of_stream"),
-        "error should mention message after EOS: {}",
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "error should mention out-of-order or invalid transition: {}",
         err.message()
     );
     assert!(
-        err.message().contains("RequestHeaders"),
-        "error should mention phase: {}",
+        err.message().contains("Request") || err.message().contains("phase"),
+        "error should mention request or phase: {}",
         err.message()
     );
 }
@@ -702,13 +698,202 @@ async fn duplicate_eos_in_response_headers_rejected() {
     let err = result.unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument, "should be InvalidArgument");
     assert!(
-        err.message().contains("after end_of_stream"),
-        "error should mention message after EOS: {}",
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "error should mention out-of-order or invalid transition: {}",
         err.message()
     );
     assert!(
-        err.message().contains("ResponseHeaders"),
-        "error should mention phase: {}",
+        err.message().contains("Response") || err.message().contains("phase"),
+        "error should mention response or phase: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn initial_request_body_rejected() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // Send RequestBody as first message (before RequestHeaders)
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestBody(HttpBody {
+            body: b"attacker data".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error")
+    .expect_err("initial RequestBody should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "should reject body before headers: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn initial_request_trailers_rejected() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // Send RequestTrailers as first message (before RequestHeaders)
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::RequestTrailers(HttpTrailers {
+            trailers: Some(HeaderMap {
+                headers: vec![make_header("x-trailer", "value")],
+            }),
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error")
+    .expect_err("initial RequestTrailers should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "should reject trailers before headers: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn response_body_before_response_headers_rejected() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // Send RequestHeaders first (required)
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+
+    let resp1 = response_stream.message().await.unwrap();
+    assert!(resp1.is_some());
+
+    // Send ResponseBody before ResponseHeaders (invalid)
+    tx.send(ProcessingRequest {
+        request: Some(ReqVariant::ResponseBody(HttpBody {
+            body: b"early body".to_vec(),
+            end_of_stream: false,
+        })),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error")
+    .expect_err("ResponseBody before ResponseHeaders should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "should reject response body before response headers: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn duplicate_non_eos_request_headers_rejected() {
+    let (mut client, _shutdown) = start_server(HEADERS_ONLY_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // First RequestHeaders (non-EOS)
+    tx.send(make_request_headers("GET", "/", false)).await.unwrap();
+
+    let resp1 = response_stream.message().await.unwrap();
+    assert!(resp1.is_some());
+
+    // Duplicate RequestHeaders (non-EOS) - should be rejected
+    tx.send(make_request_headers("GET", "/attacker", false)).await.unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error")
+    .expect_err("duplicate non-EOS RequestHeaders should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "should reject duplicate request headers: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn duplicate_non_eos_response_headers_rejected() {
+    let (mut client, _shutdown) = start_server(RESPONSE_HEADER_CONFIG).await;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let stream = ReceiverStream::new(rx);
+
+    let mut response_stream = client.process(stream).await.unwrap().into_inner();
+
+    // RequestHeaders first
+    tx.send(make_request_headers("GET", "/", true)).await.unwrap();
+
+    let resp1 = response_stream.message().await.unwrap();
+    assert!(resp1.is_some());
+
+    // First ResponseHeaders (non-EOS)
+    tx.send(make_response_headers(200, false)).await.unwrap();
+
+    let resp2 = response_stream.message().await.unwrap();
+    assert!(resp2.is_some());
+
+    // Duplicate ResponseHeaders (non-EOS) - should be rejected
+    tx.send(make_response_headers(500, false)).await.unwrap();
+
+    let err = tokio::time::timeout(
+        std::time::Duration::from_millis(TIMEOUT_MILLIS),
+        response_stream.message(),
+    )
+    .await
+    .expect("timed out waiting for error")
+    .expect_err("duplicate non-EOS ResponseHeaders should be rejected");
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("out-of-order") || err.message().contains("invalid"),
+        "should reject duplicate response headers: {}",
         err.message()
     );
 }

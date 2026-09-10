@@ -297,10 +297,14 @@ impl PhaseOrderTracker {
                 &mut self.response
             },
         };
+        let invalid_transition = match *current {
+            None => step != PhaseStep::Headers,
+            Some(prev) => step < prev || (step == prev && step != PhaseStep::Body),
+        };
 
-        if current.is_some_and(|prev| step < prev) {
+        if invalid_transition {
             return Err(Status::invalid_argument(format!(
-                "out-of-order ExtProc message: {} arrived after a later {side:?} phase",
+                "out-of-order ExtProc message: invalid {side:?} phase transition to {}",
                 request_type_label(req)
             )));
         }
