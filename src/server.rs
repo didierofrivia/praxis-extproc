@@ -171,14 +171,7 @@ async fn process_messages(
     while let Some(result) = inbound.next().await {
         let msg = result.map_err(|e| Status::internal(e.to_string()))?;
 
-        if let Some(proto_cfg) = msg.protocol_config {
-            if first_message_processed {
-                return Err(Status::invalid_argument(
-                    "protocol_config may only be sent on the first stream message",
-                ));
-            }
-            config_from_first_message(stream_state, proto_cfg)?;
-        }
+        apply_protocol_config(stream_state, msg.protocol_config, first_message_processed)?;
         first_message_processed = true;
 
         let Some(req) = msg.request else {
@@ -201,6 +194,29 @@ async fn process_messages(
     }
 
     Ok(())
+}
+
+/// Apply a first-message `protocol_config`, rejecting late deliveries.
+///
+/// # Errors
+///
+/// Returns [`Status::invalid_argument`] if `protocol_config` arrives after the
+/// first message, or if it requests an unsupported body mode.
+fn apply_protocol_config(
+    stream_state: &mut StreamState,
+    proto_cfg: Option<ProtocolConfiguration>,
+    first_message_processed: bool,
+) -> Result<(), Status> {
+    let Some(proto_cfg) = proto_cfg else {
+        return Ok(());
+    };
+    if first_message_processed {
+        metrics::record_invalid_argument("protocol_config", "after_first_message");
+        return Err(Status::invalid_argument(
+            "protocol_config may only be sent on the first stream message",
+        ));
+    }
+    config_from_first_message(stream_state, proto_cfg)
 }
 
 /// Parses `protocol_config` from first message.
