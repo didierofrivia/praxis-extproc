@@ -35,6 +35,10 @@ pub fn register() {
         "praxis_extproc_body_size_rejections_total",
         "Total requests rejected for exceeding max body accumulation"
     );
+    metrics::describe_counter!(
+        "praxis_extproc_invalid_argument_total",
+        "Total invalid_argument rejections, by reason and detail"
+    );
 }
 
 /// Record a completed stream.
@@ -51,6 +55,16 @@ pub fn record_immediate_response() {
 /// Record a rejection for exceeding max body accumulation.
 pub fn record_body_size_rejection() {
     metrics::counter!("praxis_extproc_body_size_rejections_total").increment(1);
+}
+
+/// Record an `invalid_argument` rejection under bounded `reason` and `detail` labels.
+pub fn record_invalid_argument(reason: &'static str, detail: &'static str) {
+    metrics::counter!(
+        "praxis_extproc_invalid_argument_total",
+        "reason" => reason,
+        "detail" => detail,
+    )
+    .increment(1);
 }
 
 // -----------------------------------------------------------------------------

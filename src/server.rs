@@ -209,7 +209,10 @@ async fn process_messages(
 ///
 /// Returns [`Status::invalid_argument`] if unsupported body modes are requested.
 fn config_from_first_message(stream_state: &mut StreamState, proto_cfg: ProtocolConfiguration) -> Result<(), Status> {
-    stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(Status::invalid_argument)?;
+    stream_state.protocol_config = ProtocolConfig::try_from(proto_cfg).map_err(|m| {
+        metrics::record_invalid_argument("protocol_config", "unsupported_mode");
+        Status::invalid_argument(m)
+    })?;
     debug!(
         request_mode = ?stream_state.protocol_config.request_body_mode,
         response_mode = ?stream_state.protocol_config.response_body_mode,
@@ -289,6 +292,7 @@ impl PhaseOrderTracker {
             PhaseSide::Request => &mut self.request,
             PhaseSide::Response => {
                 if !self.request_headers_seen {
+                    metrics::record_invalid_argument("message_order", "response_before_request_headers");
                     return Err(Status::invalid_argument(format!(
                         "out-of-order ExtProc message: {} arrived before request headers",
                         request_type_label(req)
@@ -303,6 +307,7 @@ impl PhaseOrderTracker {
         };
 
         if invalid_transition {
+            metrics::record_invalid_argument("message_order", "invalid_phase_transition");
             return Err(Status::invalid_argument(format!(
                 "out-of-order ExtProc message: invalid {side:?} phase transition to {}",
                 request_type_label(req)
@@ -428,6 +433,7 @@ impl EosTracker {
         };
 
         if headers_completed {
+            metrics::record_invalid_argument("message_order", "body_after_headers_eos");
             return Err(Status::invalid_argument(format!(
                 "received {phase:?} message after headers end_of_stream was already marked"
             )));
@@ -452,6 +458,7 @@ impl EosTracker {
 
 /// Error for a message re-delivered after its phase already completed.
 fn duplicate_after_eos(phase: ProtocolPhase) -> Status {
+    metrics::record_invalid_argument("duplicate_eos", "redelivery");
     Status::invalid_argument(format!(
         "received {phase:?} message after end_of_stream was already marked"
     ))
@@ -673,6 +680,7 @@ async fn run_request_pipeline(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
+        metrics::record_invalid_argument("missing_headers", "request");
         return Err(Status::invalid_argument("request headers not received"));
     };
     let mut ctx = adapter::build_filter_context(pipeline, request);
@@ -725,13 +733,14 @@ async fn run_response_pipeline(
     state: &mut StreamState,
 ) -> Result<Vec<ProcessingResponse>, Status> {
     let Some(request) = state.request.as_ref() else {
+        metrics::record_invalid_argument("missing_headers", "request");
         return Err(Status::invalid_argument("request headers not received"));
     };
 
-    let mut resp = state
-        .response
-        .take()
-        .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+    let mut resp = state.response.take().ok_or_else(|| {
+        metrics::record_invalid_argument("missing_headers", "response");
+        Status::invalid_argument("response headers not received")
+    })?;
 
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
@@ -914,17 +923,17 @@ async fn process_streamed_body_chunk(
     state: &mut StreamState,
     is_request: bool,
 ) -> Result<Vec<ProcessingResponse>, Status> {
-    let request = state
-        .request
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("request headers not received"))?;
+    let request = state.request.as_ref().ok_or_else(|| {
+        metrics::record_invalid_argument("missing_headers", "request");
+        Status::invalid_argument("request headers not received")
+    })?;
     let mut ctx = adapter::build_filter_context(pipeline, request);
     state.restore_request_ctx(&mut ctx);
     if !is_request {
-        let resp = state
-            .response
-            .as_mut()
-            .ok_or_else(|| Status::invalid_argument("response headers not received"))?;
+        let resp = state.response.as_mut().ok_or_else(|| {
+            metrics::record_invalid_argument("missing_headers", "response");
+            Status::invalid_argument("response headers not received")
+        })?;
         ctx.response_header = Some(resp);
     }
     let eos = body.end_of_stream;
