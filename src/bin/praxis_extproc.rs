@@ -17,7 +17,7 @@ use praxis_extproc::{
 };
 use praxis_proto::envoy::service::ext_proc::v3::external_processor_server::ExternalProcessorServer;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // -----------------------------------------------------------------------------
 // CLI
@@ -71,6 +71,7 @@ async fn main() {
 /// Top-level application logic.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = load_config(&cli.config)?;
+    cfg.server.validate()?;
     let registry = praxis_ai_filters::build_ai_registry();
     let pipeline = config::build_pipeline(&cfg, &registry);
 
@@ -89,14 +90,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Box::pin(serve_unready(addrs, fips.active)).await;
     }
 
-    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server.tls, fips.active)).await
+    Box::pin(serve_pipeline(addrs, pipeline, &cfg.server, fips.active)).await
 }
 
 /// Serve the built pipeline, or a not-ready endpoint if it failed to build.
 async fn serve_pipeline(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: Result<std::sync::Arc<praxis_filter::FilterPipeline>, ExtProcError>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match pipeline {
@@ -106,7 +107,7 @@ async fn serve_pipeline(
                 metrics = %addrs.2, filters = pipeline.len(),
                 "starting ExtProc server"
             );
-            Box::pin(start_services(addrs, pipeline, tls_cfg, fips_active)).await
+            Box::pin(start_services(addrs, pipeline, server_cfg, fips_active)).await
         },
         Err(e) => {
             error!(error = %e, health = %addrs.1, "filter pipeline build failed; reporting NotServing");
@@ -119,14 +120,14 @@ async fn serve_pipeline(
 async fn start_services(
     addrs: (std::net::SocketAddr, std::net::SocketAddr, std::net::SocketAddr),
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
     fips_active: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Box::pin(run_with_sidecars(
         addrs,
         true,
         fips_active,
-        serve_grpc(addrs.0, pipeline, tls_cfg),
+        serve_grpc(addrs.0, pipeline, server_cfg),
     ))
     .await
 }
@@ -231,12 +232,18 @@ where
 async fn serve_grpc(
     addr: std::net::SocketAddr,
     pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
-    tls_cfg: &tls::TlsConfig,
+    server_cfg: &config::ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline));
-    match tls::build_tls_config(tls_cfg)? {
-        None => Box::pin(serve_plaintext(addr, svc)).await,
-        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, tls_cfg)).await,
+    // The latch fires when the drain deadline expires, forcing any streams still
+    // running after graceful shutdown began to cancel.
+    let (force_tx, force_rx) = tokio::sync::watch::channel(false);
+    let svc = ExternalProcessorServer::new(PraxisExtProc::new(pipeline).with_force_shutdown(force_rx));
+    let drain = std::time::Duration::from_secs(server_cfg.shutdown_drain_timeout_secs);
+    let shutdown = shutdown_with_deadline(force_tx, drain);
+
+    match tls::build_tls_config(&server_cfg.tls)? {
+        None => Box::pin(serve_plaintext(addr, svc, shutdown)).await,
+        Some(acceptor) => Box::pin(serve_tls(addr, svc, acceptor, &server_cfg.tls, shutdown)).await,
     }
 }
 
@@ -244,13 +251,9 @@ async fn serve_grpc(
 async fn serve_plaintext(
     addr: std::net::SocketAddr,
     svc: ExternalProcessorServer<PraxisExtProc>,
+    shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    Box::pin(
-        Server::builder()
-            .add_service(svc)
-            .serve_with_shutdown(addr, shutdown_signal()),
-    )
-    .await?;
+    Box::pin(Server::builder().add_service(svc).serve_with_shutdown(addr, shutdown)).await?;
     Ok(())
 }
 
@@ -260,6 +263,7 @@ async fn serve_tls(
     svc: ExternalProcessorServer<PraxisExtProc>,
     acceptor: openssl::ssl::SslAcceptor,
     tls_cfg: &tls::TlsConfig,
+    shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs);
@@ -267,7 +271,7 @@ async fn serve_tls(
     Box::pin(
         Server::builder()
             .add_service(svc)
-            .serve_with_incoming_shutdown(incoming, shutdown_signal()),
+            .serve_with_incoming_shutdown(incoming, shutdown),
     )
     .await?;
     Ok(())
@@ -276,6 +280,24 @@ async fn serve_tls(
 // -----------------------------------------------------------------------------
 // Shutdown
 // -----------------------------------------------------------------------------
+
+/// Wait for the shutdown signal, then arm the drain deadline.
+///
+/// Returning starts tonic's graceful drain; a detached timer force-cancels any
+/// streams still running once `drain` elapses by flipping the shared latch.
+async fn shutdown_with_deadline(force_tx: tokio::sync::watch::Sender<bool>, drain: std::time::Duration) {
+    shutdown_signal().await;
+    tokio::spawn(async move {
+        tokio::time::sleep(drain).await;
+        warn!(
+            timeout_secs = drain.as_secs(),
+            "graceful drain deadline exceeded; forcing stream cancellation"
+        );
+        if force_tx.send(true).is_err() {
+            info!("drain deadline expired but no streams remained to cancel");
+        }
+    });
+}
 
 /// Wait for SIGTERM or SIGINT for graceful shutdown.
 #[expect(
