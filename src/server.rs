@@ -159,8 +159,11 @@ impl ExternalProcessor for PraxisExtProc {
                     }
                 }
                 () = wait_force(force) => {
+                    // Best-effort notification: never block on a full channel. The
+                    // deadline race in the binary drops the serving future, which
+                    // force-closes the connection regardless of delivery.
                     warn!("drain deadline exceeded; forcefully cancelling stream");
-                    drop(tx.send(Err(Status::unavailable("server shutting down"))).await);
+                    drop(tx.try_send(Err(Status::unavailable("server shutting down"))));
                 }
             }
         });
