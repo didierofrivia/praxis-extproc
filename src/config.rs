@@ -229,9 +229,7 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
     let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
-    pipeline.set_allow_private_upstreams(
-        config.insecure_options.allow_private_upstreams,
-    );
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
 
     pipeline
         .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
