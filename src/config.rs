@@ -229,6 +229,10 @@ pub fn build_pipeline(config: &ExtProcConfig, registry: &FilterRegistry) -> Resu
     let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
 
+    pipeline.set_allow_private_upstreams(
+        config.insecure_options.allow_private_upstreams,
+    );
+
     pipeline
         .apply_body_limits(None, None, config.insecure_options.allow_unbounded_body)
         .map_err(|e| ExtProcError::Pipeline(e.to_string()))?;
@@ -453,6 +457,27 @@ filter_chains:
         let pipeline = build_pipeline(&cfg, &registry).unwrap();
 
         assert_eq!(pipeline.len(), 2, "pipeline should have two filters");
+    }
+
+    #[test]
+    fn allow_private_upstreams_is_applied_to_pipeline() {
+        let cfg: ExtProcConfig = serde_yaml::from_str(
+            r#"
+filter_chains:
+  - name: main
+    filters:
+      - filter: request_id
+
+insecure_options:
+  allow_private_upstreams: true
+"#,
+        )
+        .unwrap();
+
+        let registry = praxis_ai_filters::build_ai_registry();
+        let pipeline = build_pipeline(&cfg, &registry).unwrap();
+
+        assert!(pipeline.allow_private_upstreams());
     }
 
     #[test]
