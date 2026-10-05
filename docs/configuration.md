@@ -86,10 +86,9 @@ ExtProc mode, plus in-tree [Praxis AI] filters from
 | `cors` | CORS preflight and origin validation |
 | `csrf` | CSRF protection via origin validation |
 | `rate_limit` | Token bucket rate limiting |
-| `json_body_field` | Extract JSON body field to header |
+| `json_body` | Extract/rewrite JSON body fields (e.g. promote `model` to a header via `request_extract`) |
 | `path_rewrite` | Rewrite request path |
 | `url_rewrite` | Regex path + query rewriting |
-| `model_to_header` | Promote JSON `model` field to a request header |
 | `prompt_enrich` | Prepend/append chat messages |
 | `token_count` | Count tokens for a provider |
 | `ai_guardrails` | AI content guardrails |
@@ -347,8 +346,8 @@ Working examples in the `examples/` directory:
 | File | Description |
 | --- | --- |
 | [praxis-extproc.yaml] | Common filters: request ID, access log, guardrails, headers |
-| [ai-model-to-header.yaml] | AI `model_to_header` with request ID and headers |
-| [llmisvc-model-provider-resolver.yaml] | `model_to_header` plus `llmisvc_model_provider_resolver` for KServe routing |
+| [ai-model-to-header.yaml] | AI `json_body` model-to-header extraction with request ID and headers |
+| [llmisvc-model-provider-resolver.yaml] | `json_body` plus `llmisvc_model_provider_resolver` for KServe routing |
 | [envoy.yaml] | Envoy config wiring up the ExtProc filter |
 | [branch-chains.yaml] | Conditional branching on filter results |
 
