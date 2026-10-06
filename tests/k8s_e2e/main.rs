@@ -6,7 +6,7 @@
 //! Tests the full BBR + IPP ext-proc topology with header-based model routing:
 //!
 //! ```text
-//! Client → Gateway → [ipp-pre: model_to_header → X-Gateway-Model-Name]
+//! Client → Gateway → [ipp-pre: json_body → X-Gateway-Model-Name]
 //!                   → [ipp: response headers]
 //!                   → HTTPRoute (header match) → llm-katan
 //! ```

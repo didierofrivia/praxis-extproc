@@ -11,7 +11,7 @@ spec:
       gateway.networking.k8s.io/gateway-name: e2e-gateway
   configPatches:
     # -----------------------------------------------------------------
-    # configPatches[0] — ipp-pre: BBR. model_to_header extracts the model
+    # configPatches[0] — ipp-pre: BBR. json_body extracts the model
     # from the body, sets X-Gateway-Model-Name + clear_route_cache so
     # Envoy re-evaluates routes with the header present.
     #

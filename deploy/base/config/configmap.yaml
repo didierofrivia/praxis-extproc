@@ -16,8 +16,14 @@ data:
     filter_chains:
       - name: bbr
         filters:
-          - filter: model_to_header
-            header: X-Gateway-Model-Name
+          - filter: headers
+            request_remove:
+              - X-Gateway-Model-Name
+          - filter: json_body
+            request_extract:
+              - pointer: /model
+                header: X-Gateway-Model-Name
+            on_invalid: continue
           - filter: llmisvc_model_provider_resolver
             header: X-Gateway-Model-Name
 
