@@ -86,8 +86,9 @@ Without these, MaaS cannot safely route inference requests.
 
 ### Requirements
 
-- Use the existing `model_to_header` filter from `praxis-ai-filters`
-  to extract the model name from JSON request bodies.
+- Use the core `json_body` filter (a `request_extract` entry with
+  `pointer: /model`) to extract the model name from JSON request
+  bodies.
 - Store model-to-provider mappings in an in-memory routing table
   loaded from configuration.
 - Perform case-insensitive model lookups to handle variations like
@@ -128,7 +129,7 @@ BBR does not perform caller authorization checks:
 │                      server.rs                              │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │              run_request_filters()                   │   │
-│  │  1. Run filter pipeline (includes model_to_header)   │   │
+│  │  1. Run filter pipeline (includes json_body)         │   │
 │  │  2. Extract model from X-AI-Model header             │   │
 │  │  3. Call BbrProcessor.process_request()              │   │
 │  │  4. Merge BBR mutations with filter mutations        │   │

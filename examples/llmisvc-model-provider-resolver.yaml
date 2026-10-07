@@ -21,8 +21,11 @@ filter_chains:
 
   - name: ai
     filters:
-      - filter: model_to_header
-        header: X-Model
+      - filter: json_body
+        request_extract:
+          - pointer: /model
+            header: X-Model
+        on_invalid: continue
       - filter: llmisvc_model_provider_resolver
         header: X-Model
 

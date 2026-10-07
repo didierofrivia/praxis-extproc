@@ -498,7 +498,7 @@ insecure_options:
 filter_chains:
   - name: main
     filters:
-      - filter: model_to_header
+      - filter: llmisvc_model_provider_resolver
         header: X-AI-Model
 "#,
         )

@@ -1,6 +1,6 @@
 # Example ExtProc configuration using Praxis AI filters.
 #
-# Extracts the JSON "model" field into X-AI-Model via model_to_header.
+# Extracts the JSON "model" field into X-AI-Model via json_body request_extract.
 #
 # Start:
 #   praxis-extproc -c examples/ai-model-to-header.yaml
@@ -19,8 +19,11 @@ filter_chains:
 
   - name: ai
     filters:
-      - filter: model_to_header
-        header: X-AI-Model
+      - filter: json_body
+        request_extract:
+          - pointer: /model
+            header: X-AI-Model
+        on_invalid: continue
 
   - name: transformation
     filters:

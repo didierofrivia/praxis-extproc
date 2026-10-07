@@ -19,8 +19,11 @@ data:
       - name: ai-filters
         filters:
           - filter: anthropic_messages_to_chat_completions
-          - filter: model_to_header
-            header: X-Model-Name
+          - filter: json_body
+            request_extract:
+              - pointer: /model
+                header: X-Model-Name
+            on_invalid: continue
           - filter: headers
             request_add:
               - name: X-Praxis-Processed
