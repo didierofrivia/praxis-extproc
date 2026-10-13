@@ -147,6 +147,10 @@ fn handle_body_redelivery(
 /// For `FDS` passthrough, runs header filters early, defers mutations to first chunk.
 ///
 /// [`Request`]: praxis_filter::Request
+#[expect(
+    clippy::too_many_lines,
+    reason = "boxing each awaited future to stay under large_stack_frames costs the extra lines"
+)]
 pub(crate) async fn handle_request_headers(
     pipeline: &FilterPipeline,
     headers: praxis_proto::envoy::service::ext_proc::v3::HttpHeaders,
@@ -165,16 +169,26 @@ pub(crate) async fn handle_request_headers(
     state.request = Some(adapter::envoy_headers_to_request(&envoy_headers));
 
     if headers.end_of_stream {
-        return run_request_pipeline(RequestPhase::Headers, pipeline, state).await;
+        return Box::pin(run_request_pipeline(RequestPhase::Headers, pipeline, state)).await;
     }
 
     match state.protocol_config.request_body_mode {
         BodyMode::None | BodyMode::Streamed => {
             state.header_state.request_headers_sent = true;
-            run_request_header_filters_early(pipeline, state, MutationDelivery::Send).await
+            Box::pin(run_request_header_filters_early(
+                pipeline,
+                state,
+                MutationDelivery::Send,
+            ))
+            .await
         },
         BodyMode::FullDuplexStreamed if !pipeline.body_capabilities().needs_request_body => {
-            run_request_header_filters_early(pipeline, state, MutationDelivery::DeferSilent).await
+            Box::pin(run_request_header_filters_early(
+                pipeline,
+                state,
+                MutationDelivery::DeferSilent,
+            ))
+            .await
         },
         BodyMode::FullDuplexStreamed => Ok(Vec::new()),
         _ => Ok(vec![response::request_headers(None)]),
