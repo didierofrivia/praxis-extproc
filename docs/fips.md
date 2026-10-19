@@ -24,8 +24,8 @@ goes into it. How the build is checked and how the tooling works is in
 
 The `Containerfile` builds the FIPS feature set by default, on
 `ubi9/ubi` with Red Hat's `rust-toolset` and OpenSSL, and ships on
-`ubi9/ubi-minimal`; both bases are pinned by digest and their Red Hat
-signatures are verified before every podman build here. ODH Konflux builds
+`ubi9/ubi-minimal`; both bases are pinned by digest in the `Containerfile`
+and Makefile. ODH Konflux builds
 `Containerfile`; downstream mirrors `Dockerfile.konflux` (see below). There
 is no separate FIPS tag: the image is the FIPS build.
 
@@ -72,11 +72,10 @@ check-payload evidence. It has no `report` stage; compliance reports still use
 
 When you change digest pins, `CARGO_FEATURES`, the cargo-auditable SBOM recipe
 in `Containerfile`, or runtime layout, update `Containerfile`, `Dockerfile.konflux`
-(where applicable), and the Makefile digest variables.
-`make fips-verify-image` checks that `Containerfile` and `Dockerfile.konflux`
-default-pin the same `ubi9/ubi` builder digest (the Konflux runtime uses
-`ubi-minimal-pqc` on `registry.redhat.io`, verified separately when you bump
-that pin). To build the Konflux file locally:
+(where applicable), and the Makefile digest variables. Keep the `ubi9/ubi`
+builder digest consistent between `Containerfile` and `Dockerfile.konflux`
+(the Konflux runtime uses `ubi-minimal-pqc` on `registry.redhat.io`). To build
+the Konflux file locally:
 
 ```console
 podman build -f Dockerfile.konflux .
@@ -201,7 +200,6 @@ fatal error=crypto: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: t
 On a developer machine (no FIPS host needed):
 
 ```console
-make fips-signature-store  # once on Debian/Ubuntu: their podman has no entry for Red Hat's signature store
 make fips-check            # build on UBI 9 with Red Hat's toolchain, print the compliance report
 make container-release     # the product image
 make fips-smoke            # run it once: the example config validates with the system OpenSSL

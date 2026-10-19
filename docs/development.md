@@ -8,9 +8,9 @@ Praxis ExtProc.
 - Rust stable 1.96+ (edition 2024)
 - Rust nightly (for `rustfmt`; `group_imports` and
   `imports_granularity` are nightly-only)
-- Docker or Podman (container builds; the FIPS checks,
-  the base image signature verification and Red Hat's
-  scanner need Podman on Linux)
+- Docker or Podman (container builds; FIPS image build,
+  smoke, and scan targets, including Red Hat's
+  check-payload scanner, need Podman on Linux)
 - Go 1.26+ and the OpenShift CLI `oc` (`make fips-scanner`,
   `make fips-scan`; optional)
 - [KIND] (local Kubernetes testing)
@@ -59,8 +59,8 @@ src/
   tls.rs               # TLS configuration
   fips.rs              # The crypto provider, FIPS signals, PRAXIS_REQUIRE_FIPS
 xtask/
-  src/fips/            # cargo xtask fips: report, verify-image, signature-store
-  assets/fips/         # Red Hat's release key, its signature store entry
+  src/fips/            # cargo xtask fips: report, host-check, runtime-probe
+  assets/fips/         # FIPS provider config, certified modules, OpenSSL symbol list
 tests/
   grpc_server.rs       # In-process gRPC server tests
   services.rs          # Health and metrics service tests
@@ -199,8 +199,8 @@ binary links UBI9 `libcrypto.so.3`) and
 `ubi9/ubi-minimal` at runtime, which already ships
 `openssl-libs` and the FIPS provider module; nothing
 is installed into it. Both bases are pinned by digest
-and, with podman, their Red Hat signatures are
-verified before every build. The release build embeds
+via Makefile `FIPS_UBI9_DIGEST` / `FIPS_UBI9_MINIMAL_DIGEST`
+build-args. The release build embeds
 the list of compiled crates with cargo-auditable, from
 cargo's SBOM precursor, which Red Hat's scanner reads.
 Cargo is invoked with `--ignore-rust-version` because
@@ -247,8 +247,6 @@ by a Makefile target; the same report runs inside the
 | Command | Makefile | Purpose |
 |---|---|---|
 | `cargo xtask fips report [--deps-only] [--features LIST] [--offline] [--out FILE] [BINARY]` | `fips-deps`, `fips-report`, `fips-check` | The compliance report: environment, dependency graph, binary structure, source guards, with a reason and a pointer for every finding. Exit status 1 while findings remain. |
-| `cargo xtask fips verify-image REFERENCE` | `fips-verify-image` (run by `container-release` under podman and by `fips-check` first) | Refuses any base image that is not digest-pinned, from `registry.access.redhat.com`, and signed by Red Hat's release key. |
-| `cargo xtask fips signature-store [--install]` | `fips-signature-store` | Whether podman's `registries.d` names Red Hat's signature store, without which every Red Hat image looks unsigned; `--install` adds the bundled entry for the current user on hosts whose podman packaging ships none (Debian, Ubuntu, GitHub's runners). CI runs it before `fips-verify-image`. |
 | `check-payload scan image ...` | `fips-scanner`, `fips-scan` | Red Hat's own scanner at a pinned revision, run against the image with warnings fatal: the actual gate. |
 
 The Makefile targets, in the order CI runs them:
@@ -256,8 +254,6 @@ The Makefile targets, in the order CI runs them:
 ```console
 make fips-deps           # dependency graph vs the denylist (seconds, no build)
 make fips-scanner        # build check-payload at its pinned revision (needs Go)
-make fips-signature-store  # once on Debian/Ubuntu hosts
-make fips-verify-image   # the pinned UBI 9 bases are Red Hat's (digest + signature)
 make fips-check          # build on UBI 9 with Red Hat's toolchain, print the report
 make container-release   # the product image
 make fips-smoke          # run it once: the example config validates
@@ -305,8 +301,6 @@ From `xtask/assets/fips/`:
 
 | File | Purpose |
 |---|---|
-| `redhat-release-key-2.asc` | Red Hat, Inc. (release key 2), the GPG key Red Hat signs its container images with. Downloaded on 2026-09-22 from `https://access.redhat.com/security/data/fd431d51.txt`; its fingerprint, `567E 347A D004 4ADE 55BA 8A5F 199E 2F91 FD43 1D51`, matches the one Red Hat publishes at `https://access.redhat.com/security/team/key`. `verify-image` recomputes the fingerprint on every run (RFC 4880 v4, in Rust) and refuses to proceed if it differs; `cargo test -p xtask` checks the same. podman's own signature check needs gnupg installed. |
-| `registry.access.redhat.com.yaml` | The `registries.d` entry that tells podman where Red Hat's signature store is. podman reads only its own `registries.d` (`~/.config/containers/registries.d` when it exists, else `/etc/containers/registries.d`); Fedora and RHEL ship the same entry in containers-common, Debian and Ubuntu ship no `registries.d` at all, which `make fips-signature-store` fixes for the current user. |
 | `fips-provider.cnf` | An `OPENSSL_CONF` that activates the RHEL FIPS provider for one process, used by the report to probe FIPS behaviour on hosts that are not in FIPS mode. Test infrastructure only; the application never enables FIPS itself. |
 
 ### cargo-auditable and cargo's SBOM precursor
@@ -379,10 +373,9 @@ The digests live in the `Makefile` (`FIPS_UBI9_DIGEST`,
 
 ```console
 curl -sI -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json'   https://registry.access.redhat.com/v2/ubi9/ubi/manifests/latest | grep -i docker-content-digest
-cargo xtask fips verify-image registry.access.redhat.com/ubi9/ubi@sha256:<new digest>
 ```
 
-Only update both places once the verification passes.
+Update `FIPS_UBI9_DIGEST` / `FIPS_UBI9_MINIMAL_DIGEST` in the `Makefile` and the matching `ARG` defaults in the `Containerfile` (and `Dockerfile.konflux` for the builder digest).
 
 ## Project Management
 

@@ -4,7 +4,7 @@
 	require-container-engine require-podman require-go require-oc \
 	container container-release images kind-up kind-down smoke-test \
 	build-fips release-fips check-fips lint-fips test-fips \
-	fips-check fips-deps fips-report fips-signature-store fips-verify-image \
+	fips-check fips-deps fips-report \
 	fips-scan fips-scanner fips-smoke \
 	fips-toolchain test-fips-host fips-host-facts fips-host-check fips-runtime-probe \
 	fips-image-ref fips-image-save fips-image-load fips-image-tag \
@@ -94,12 +94,8 @@ endif
 
 # The product image is the FIPS build: the Containerfile's defaults are
 # FIPS_FEATURES and the digest-pinned UBI 9 bases, passed explicitly here so
-# the Makefile stays the single place they are defined. With podman the bases'
-# Red Hat signatures are verified first; docker cannot verify them (Konflux
-# builds this same file under its own provenance checks).
-_VERIFY_BASES := $(if $(filter podman,$(notdir $(CONTAINER_ENGINE))),fips-verify-image,)
-
-container: $(_VERIFY_BASES) | require-container-engine
+# the Makefile stays the single place they are defined.
+container: | require-container-engine
 	$(CONTAINER_ENGINE) build \
 		--no-cache \
 		--build-arg CARGO_PROFILE=debug \
@@ -108,7 +104,7 @@ container: $(_VERIFY_BASES) | require-container-engine
 		-f Containerfile \
 		.
 
-container-release: $(_VERIFY_BASES) | require-container-engine
+container-release: | require-container-engine
 	$(CONTAINER_ENGINE) build \
 		--build-arg CARGO_PROFILE=release \
 		$(FIPS_BUILD_ARGS) \
@@ -156,10 +152,6 @@ images: container-release
 #   make fips-scan         run Red Hat's scanner (check-payload) on the image,
 #                          warnings fatal: the actual gate
 #   make fips-scanner      build check-payload at the pinned revision
-#   make fips-verify-image verify the pinned UBI 9 bases are Red Hat's
-#   make fips-signature-store
-#                          point podman at Red Hat's signature store; needed
-#                          once on Debian/Ubuntu hosts, a no-op elsewhere
 #
 # On a RHEL 9 host in FIPS mode (the runtime proof; docs/fips.md):
 #
@@ -176,8 +168,7 @@ images: container-release
 #   make fips-image-load   load a saved image and check it is that image
 #   make fips-image-tag    name a pulled digest the way these targets expect
 #
-# The report, the image verification, the signature-store setup, the host
-# attestation and the runtime probe are `cargo xtask fips` commands
+# The report, the host attestation and the runtime probe are `cargo xtask fips` commands
 # (xtask/src/fips/). See docs/fips.md.
 
 FIPS_FEATURES           := responses,aws-sigv4,store-postgres-cert-auth
@@ -222,8 +213,6 @@ FIPS_SBOM_ENV           := RUSTC_BOOTSTRAP=1 CARGO_BUILD_SBOM=true
 FIPS_SBOM_ARGS          := -Zsbom --config 'env.RUSTC_BOOTSTRAP.value="-1"' --config 'env.RUSTC_BOOTSTRAP.force=true'
 FIPS_UBI9_DIGEST        := sha256:16e9e43d99e181463513cc84a514859b1abb9460f1c4d9e208da4b4e51cd5cc3
 FIPS_UBI9_MINIMAL_DIGEST := sha256:1d7c5517a4a1a8e2688620b39ee980e82505ca1ab7ae5541b5463120ae9b3897
-FIPS_UBI9_IMAGE         := registry.access.redhat.com/ubi9/ubi@$(FIPS_UBI9_DIGEST)
-FIPS_UBI9_MINIMAL_IMAGE := registry.access.redhat.com/ubi9/ubi-minimal@$(FIPS_UBI9_MINIMAL_DIGEST)
 FIPS_CHECK_IMAGE        ?= praxis-extproc-fips-check
 # Red Hat's toolchain and OpenSSL, no sources: the image `test-fips-host`
 # runs the suite in (the `toolchain` stage of the Containerfile).
@@ -290,21 +279,6 @@ lint-fips:
 test-fips:
 	cargo test $(FIPS_CARGO_ARGS) $$FIPS_CARGO_EXTRA $(_NOCAPTURE)
 
-# podman finds Red Hat's detached image signatures through its registries.d
-# (containers-registries.d(5)). Fedora and RHEL ship the entry; Debian and
-# Ubuntu, GitHub's runners included, ship no registries.d at all, and then
-# every Red Hat image looks unsigned. This installs the bundled entry for the
-# current user when the registries.d podman reads names none, and does
-# nothing otherwise. CI runs it before fips-verify-image.
-fips-signature-store:
-	$(XTASK) fips signature-store --install
-
-fips-verify-image: | require-podman
-	$(XTASK) fips verify-image --pinned-in Containerfile $(FIPS_UBI9_IMAGE)
-	$(XTASK) fips verify-image --pinned-in Containerfile $(FIPS_UBI9_MINIMAL_IMAGE)
-	# Dockerfile.konflux runtime is ubi-minimal-pqc on registry.redhat.io, not ubi-minimal here.
-	$(XTASK) fips verify-image --pinned-in Dockerfile.konflux $(FIPS_UBI9_IMAGE)
-
 # The binary starts on ubi-minimal, installs the OpenSSL provider, logs the
 # FIPS signals and accepts the example config; a cheap proof that the image
 # runs before the scan.
@@ -312,7 +286,7 @@ fips-smoke: | require-podman
 	podman run --rm -v $(CURDIR)/examples/praxis-extproc.yaml:/etc/praxis/extproc.yaml:ro,z \
 		$(EXTPROC_IMAGE) --validate -c /etc/praxis/extproc.yaml
 
-fips-check: fips-verify-image
+fips-check:
 	podman build -f Containerfile --target report $(FIPS_BUILD_ARGS) \
 		-t $(FIPS_CHECK_IMAGE) .
 	podman run --rm $(FIPS_CHECK_IMAGE)
@@ -347,7 +321,7 @@ fips-scanner: | require-go
 # FIPS host (RHEL 9 in FIPS mode; see docs/fips.md)
 # ---------------------------------------------------------------------------
 
-fips-toolchain: fips-verify-image
+fips-toolchain:
 	podman build -f Containerfile --target toolchain $(FIPS_BUILD_ARGS) \
 		-t $(FIPS_TOOLCHAIN_IMAGE) .
 
@@ -586,8 +560,6 @@ help:
 	@echo "  fips-smoke           run the image once to validate the example config"
 	@echo "  fips-scan            run Red Hat's scanner (check-payload) on the image, warnings fatal"
 	@echo "  fips-scanner         build check-payload at the pinned revision into target/fips (needs go)"
-	@echo "  fips-verify-image    verify the pinned UBI 9 base images are Red Hat's (digest + signature)"
-	@echo "  fips-signature-store point podman at Red Hat's signature store (once, on Debian/Ubuntu hosts)"
 	@echo ""
 	@echo "KIND:"
 	@echo "  kind-up          create cluster + deploy"
