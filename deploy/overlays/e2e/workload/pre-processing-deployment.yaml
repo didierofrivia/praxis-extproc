@@ -36,6 +36,10 @@ spec:
           args:
             - -c
             - /etc/praxis/extproc.yaml
+          env:
+            # Hop index for e2e_body_oracle: pre-IPP is the first hop.
+            - name: BODY_ORACLE_HOP_INDEX
+              value: "1"
           ports:
             - containerPort: 9004
               name: grpc

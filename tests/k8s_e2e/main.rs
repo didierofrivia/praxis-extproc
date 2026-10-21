@@ -40,9 +40,12 @@
 
 mod fixtures;
 
+mod chained_oracle;
 mod completions;
 mod direct;
 mod errors;
+mod fd_streamed_oracle;
 mod filters;
 mod guardrails;
+mod oracle_helpers;
 mod routing;

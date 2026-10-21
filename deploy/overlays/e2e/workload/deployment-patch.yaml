@@ -9,3 +9,7 @@ spec:
       containers:
         - name: payload-processing
           imagePullPolicy: Never
+          env:
+            # Hop index for e2e_body_oracle: post-IPP is the second hop.
+            - name: BODY_ORACLE_HOP_INDEX
+              value: "2"

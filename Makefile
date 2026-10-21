@@ -25,7 +25,6 @@ KIND_CLUSTER_NAME ?= praxis-extproc
 # the `docker.io/library/...` Kubernetes resolves to under `imagePullPolicy: Never`.
 EXTPROC_IMAGE     ?= docker.io/library/praxis-extproc:dev
 KUBECTL           ?= kubectl --context kind-$(KIND_CLUSTER_NAME)
-
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
 endif
@@ -462,8 +461,9 @@ FORGE_CMD = "$(FORGE_BIN)" --config "$(FORGE_CONFIG)" --runtime "$(notdir $(CONT
 MODE             ?= fds
 E2E_KIND_CONTEXT ?= kind-praxis-e2e
 
-e2e-setup: images
+e2e-setup:
 	@case "$(MODE)" in fds|buffered) ;; *) echo "MODE must be fds or buffered (got '$(MODE)')"; exit 1;; esac
+	$(MAKE) container-release FIPS_FEATURES="$(FIPS_FEATURES),k8s-e2e"
 	$(FORGE_CMD) cluster create e2e
 	$(FORGE_CMD) cluster load-image e2e "$(EXTPROC_IMAGE)"
 	$(FORGE_CMD) stack apply e2e
@@ -572,7 +572,7 @@ help:
 	@echo "  manifests-openshift kubectl kustomize deploy/overlays/openshift"
 	@echo ""
 	@echo "E2E (Forge):"
-	@echo "  e2e-setup        create Kind cluster + install all stacks (MODE=fds|buffered)"
+	@echo "  e2e-setup        create Kind cluster + install all stacks (MODE=fds|buffered; k8s-e2e features)"
 	@echo "  e2e-teardown     delete Kind e2e cluster"
 	@echo "  e2e-test         run k8s e2e tests against cluster"
 	@echo ""

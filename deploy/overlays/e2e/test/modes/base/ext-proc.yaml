@@ -43,7 +43,9 @@ spec:
             message_timeout: 300s
             processing_mode:
               request_header_mode: SEND
-              response_header_mode: SKIP
+              # e2e_body_oracle on the pre-processing hop publishes its digest
+              # from on_response; SEND so the hop-1 header reaches the client.
+              response_header_mode: SEND
               request_body_mode: FULL_DUPLEX_STREAMED
               response_body_mode: NONE
               request_trailer_mode: SEND

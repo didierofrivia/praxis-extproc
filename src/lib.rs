@@ -25,5 +25,9 @@ pub mod response;
 pub mod server;
 pub mod tls;
 
+/// Qualification-only helpers (`e2e_body_oracle`); compiled with `--features k8s-e2e`.
+#[cfg(feature = "k8s-e2e")]
+pub mod e2e;
+
 #[cfg(test)]
 mod test_support;

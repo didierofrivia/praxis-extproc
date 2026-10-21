@@ -48,7 +48,8 @@ cargo test -- test_name
 src/
   lib.rs               # Crate root, module declarations
   bin/
-    praxis_extproc.rs  # Binary entry point, CLI, startup
+    praxis_extproc.rs  # Product binary (registers e2e_body_oracle with k8s-e2e)
+  e2e/                 # Non-production: body oracle (compiled with --features k8s-e2e)
   adapter.rs           # ExtProc ↔ Praxis type translation
   config.rs            # YAML config loading, pipeline build
   error.rs             # Error types (thiserror)
@@ -65,6 +66,7 @@ tests/
   grpc_server.rs       # In-process gRPC server tests
   services.rs          # Health and metrics service tests
   integration.rs       # Kubernetes integration tests
+  k8s_e2e/             # Black-box e2e tests (feature k8s-e2e), incl. body-oracle
 examples/
   praxis-extproc.yaml  # Example ExtProc configuration
   envoy.yaml           # Example Envoy configuration
@@ -230,6 +232,21 @@ dependency graph against Red Hat's denylist, the
 compliance report from a build on UBI 9, the product
 image, its smoke run, and Red Hat's scanner with
 warnings fatal.
+
+
+
+## K8s e2e body-oracle qualification
+
+The two-hop request-body SHA-256 oracle from
+[proposal #27](proposals/27_extended-e2e-tls-idle-fd-streamed.md)
+(issue [#27](https://github.com/opendatahub-io/praxis-extproc/issues/27))
+lives in the baseline k8s e2e suite: `make e2e-setup` builds and deploys the
+`praxis-extproc` image with `--features k8s-e2e` (same product binary; the
+non-production `e2e_body_oracle` filter in `src/e2e/` is compiled and
+registered only under that feature), and `make e2e-test` exercises it through
+`tests/k8s_e2e/chained_oracle.rs` and `tests/k8s_e2e/fd_streamed_oracle.rs`.
+TLS/mTLS and idle-connection qualification scenarios are follow-up work tracked
+in [#132](https://github.com/opendatahub-io/praxis-extproc/issues/132).
 
 ## FIPS Tooling
 

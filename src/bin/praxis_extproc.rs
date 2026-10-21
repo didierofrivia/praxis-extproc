@@ -75,7 +75,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fips = praxis_extproc::fips::install()?;
 
     let cfg = load_config(&cli.config)?;
-    let registry = praxis_ai_filters::build_ai_registry();
+    let registry = build_filter_registry()?;
     let pipeline = config::build_pipeline(&cfg, &registry);
 
     if cli.validate {
@@ -105,6 +105,27 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         praxis_extproc::fips::active(&fips),
     ))
     .await
+}
+
+
+/// Build the AI filter registry, plus the k8s e2e body-oracle when
+/// `--features k8s-e2e` is enabled (qualification image only; FIPS/release
+/// never enables that feature).
+#[cfg(feature = "k8s-e2e")]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    let mut registry = praxis_ai_filters::build_ai_registry();
+    praxis_extproc::e2e::register_e2e_filters(&mut registry)?;
+    Ok(registry)
+}
+
+/// Build the AI filter registry (no e2e-only filters).
+#[cfg(not(feature = "k8s-e2e"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "same Result signature as the k8s-e2e registry builder"
+)]
+fn build_filter_registry() -> Result<praxis_filter::FilterRegistry, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(praxis_ai_filters::build_ai_registry())
 }
 
 /// Why this process must not serve under `PRAXIS_REQUIRE_FIPS`, if it must
